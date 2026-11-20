@@ -591,7 +591,7 @@ if "backtest_pack" in st.session_state:
     else:
         # Ưu tiên tên bạn tự nhập -> nếu bỏ trống thì tự động dùng username Polymarket hoặc mã ví rút gọn
         final_label = sanitize_filename_part(custom_name_input) or auto_name
-        csv_filename = f"polymarket_{final_label}_{ts_tag}.csv"
+        csv_filename = f"{final_label}.csv"
 
         st.caption(f"Ví đã trích xuất: `{resolved_wallet}` • Định danh file: **{final_label}**")
 
