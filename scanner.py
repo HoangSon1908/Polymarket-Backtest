@@ -28,10 +28,117 @@ def sanitize_filename_part(name: str) -> str:
     return cleaned
 
 
+def _is_valid_profile_name(val: str) -> bool:
+    s = str(val or "").strip()
+    if not s:
+        return False
+    # Bỏ qua chuỗi là địa chỉ ví 0x... hoặc mã rút gọn 0x1234...abcd
+    if s.lower().startswith("0x") and (len(s) >= 10 or "..." in s):
+        return False
+    return True
+
+
+def lookup_profile_name_by_wallet(wallet: str) -> str:
+    """Tra cứu username/profile name trên Polymarket từ địa chỉ ví 0x... qua nhiều nguồn."""
+    w = wallet.strip()
+    w_lower = w.lower()
+    headers = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+
+    # Lớp 1: Gamma /public-profile?address=0x...
+    for addr_variant in (w, w_lower):
+        try:
+            resp = requests.get(
+                f"{GAMMA_API_BASE}/public-profile",
+                params={"address": addr_variant},
+                headers=headers,
+                timeout=8,
+            )
+            if resp.ok:
+                data = resp.json()
+                if isinstance(data, dict):
+                    for key in ("name", "pseudonym", "userName", "user_name", "username"):
+                        cand = str(data.get(key) or "").strip()
+                        if _is_valid_profile_name(cand):
+                            return cand
+        except Exception:
+            pass
+
+    # Lớp 2: Data API v2 /leaderboard (snake_case & camelCase, xác minh khớp đúng proxy_wallet)
+    try:
+        resp = requests.get(
+            f"{BASE_V2_URL}/leaderboard",
+            params={"category": "OVERALL", "timePeriod": "ALL", "user": w_lower, "limit": 5},
+            headers=headers,
+            timeout=8,
+        )
+        if resp.ok:
+            payload = resp.json()
+            rows = payload.get("data") or [] if isinstance(payload, dict) else (payload or [])
+            for item in rows:
+                pw = str(
+                    item.get("proxy_wallet")
+                    or item.get("proxyWallet")
+                    or item.get("user")
+                    or ""
+                ).strip().lower()
+                if pw == w_lower:
+                    for key in ("user_name", "userName", "name", "pseudonym"):
+                        cand = str(item.get(key) or "").strip()
+                        if _is_valid_profile_name(cand):
+                            return cand
+    except Exception:
+        pass
+
+    # Lớp 3: Gamma /public-search
+    try:
+        resp = requests.get(
+            f"{GAMMA_API_BASE}/public-search",
+            params={"q": w_lower, "search_profiles": "true", "limit_per_type": 10},
+            headers=headers,
+            timeout=8,
+        )
+        if resp.ok:
+            profiles = (resp.json() or {}).get("profiles") or []
+            for p in profiles:
+                pw = str(p.get("proxyWallet") or p.get("proxy_wallet") or p.get("address") or "").strip().lower()
+                if pw == w_lower:
+                    for key in ("name", "user_name", "userName", "pseudonym"):
+                        cand = str(p.get(key) or "").strip()
+                        if _is_valid_profile_name(cand):
+                            return cand
+    except Exception:
+        pass
+
+    # Lớp 4: Đọc metadata trực tiếp từ trang profile công khai polymarket.com/profile/0x...
+    try:
+        page = requests.get(
+            f"https://polymarket.com/profile/{w}",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        if page.ok:
+            html = page.text
+            # Tìm trong JSON nhúng của trang profile
+            for pat in (
+                r'"name"\s*:\s*"([^"]+)"',
+                r'"pseudonym"\s*:\s*"([^"]+)"',
+                r"<title>([^<|]+?)(?:\s*\(@[^)]+\))?\s*\|\s*Polymarket</title>",
+            ):
+                m = re.search(pat, html)
+                if m:
+                    cand = m.group(1).strip()
+                    if _is_valid_profile_name(cand) and cand.lower() not in ("polymarket", "profile"):
+                        return cand
+    except Exception:
+        pass
+
+    return ""
+
+
 def resolve_wallet_and_name(raw_input: str) -> tuple[str, str, str]:
     """
     Chấp nhận cả địa chỉ 0x... lẫn @username.
-    Trả về: (wallet_address, auto_name_for_file, error_message)
+    Trả về: (wallet_address, profile_name_for_file, error_message)
     """
     cleaned = raw_input.strip()
     if not cleaned:
@@ -41,57 +148,19 @@ def resolve_wallet_and_name(raw_input: str) -> tuple[str, str, str]:
     cache_key = cleaned.lower()
     if cache_key in cache:
         w_cached, n_cached = cache[cache_key]
-        return w_cached, n_cached, ""
+        # Nếu trước đó cache tạm mã rút gọn (0x1234_abcd), thử tra lại profile name 1 lần nữa
+        if not re.match(r"^0x[a-fA-F0-9]{4}_[a-fA-F0-9]{4}$", n_cached):
+            return w_cached, n_cached, ""
 
-    # Trường hợp 1: Người dùng nhập trực tiếp địa chỉ ví 0x...
+    # Trường hợp 1: Dán trực tiếp địa chỉ ví 0x...
     if EVM_ADDR_RE.match(cleaned):
         wallet = cleaned
-        short_wallet = f"{wallet[:6]}_{wallet[-4:]}"
-        found_name = ""
-
-        # Tra cứu username gắn với ví qua Gamma Public Search
-        try:
-            resp = requests.get(
-                f"{GAMMA_API_BASE}/public-search",
-                params={"q": wallet, "search_profiles": "true", "limit_per_type": 10},
-                timeout=10,
-            )
-            if resp.ok:
-                profiles = (resp.json() or {}).get("profiles") or []
-                for p in profiles:
-                    pw = str(p.get("proxyWallet") or p.get("address") or "").strip()
-                    if pw.lower() == wallet.lower():
-                        raw_uname = str(p.get("name") or p.get("pseudonym") or "").strip()
-                        if raw_uname and not raw_uname.lower().startswith("0x"):
-                            found_name = raw_uname
-                            break
-        except Exception:
-            pass
-
-        # Fallback tra cứu username qua Data API v2 Leaderboard
-        if not found_name:
-            try:
-                resp = requests.get(
-                    f"{BASE_V2_URL}/leaderboard",
-                    params={"category": "OVERALL", "timePeriod": "ALL", "user": wallet.lower(), "limit": 5},
-                    timeout=10,
-                )
-                if resp.ok:
-                    payload = resp.json()
-                    rows = payload.get("data") or [] if isinstance(payload, dict) else (payload or [])
-                    for item in rows:
-                        raw_uname = str(item.get("userName") or item.get("name") or item.get("pseudonym") or "").strip()
-                        if raw_uname and not raw_uname.lower().startswith("0x"):
-                            found_name = raw_uname
-                            break
-            except Exception:
-                pass
-
-        auto_name = sanitize_filename_part(found_name) or short_wallet
+        found_name = lookup_profile_name_by_wallet(wallet)
+        auto_name = sanitize_filename_part(found_name) or f"{wallet[:6]}_{wallet[-4:]}"
         cache[cache_key] = (wallet, auto_name)
         return wallet, auto_name, ""
 
-    # Trường hợp 2: Người dùng nhập @username -> phân giải ngược ra địa chỉ ví 0x...
+    # Trường hợp 2: Nhập @username -> phân giải ngược ra địa chỉ ví 0x...
     handle = cleaned.lstrip("@").strip()
     resolved_wallet = ""
     found_name = handle
@@ -105,7 +174,7 @@ def resolve_wallet_and_name(raw_input: str) -> tuple[str, str, str]:
         if resp.ok:
             profiles = (resp.json() or {}).get("profiles") or []
             for p in profiles:
-                pw = str(p.get("proxyWallet") or p.get("address") or "").strip()
+                pw = str(p.get("proxyWallet") or p.get("proxy_wallet") or p.get("address") or "").strip()
                 uname = str(p.get("name") or p.get("pseudonym") or "").strip()
                 if EVM_ADDR_RE.match(pw) and uname.lower() == handle.lower():
                     resolved_wallet = pw
@@ -113,10 +182,11 @@ def resolve_wallet_and_name(raw_input: str) -> tuple[str, str, str]:
                     break
             if not resolved_wallet:
                 for p in profiles:
-                    pw = str(p.get("proxyWallet") or p.get("address") or "").strip()
+                    pw = str(p.get("proxyWallet") or p.get("proxy_wallet") or p.get("address") or "").strip()
                     if EVM_ADDR_RE.match(pw):
                         resolved_wallet = pw
-                        found_name = str(p.get("name") or p.get("pseudonym") or handle).strip()
+                        cand = str(p.get("name") or p.get("pseudonym") or "").strip()
+                        found_name = cand if _is_valid_profile_name(cand) else handle
                         break
     except Exception:
         pass
@@ -132,10 +202,11 @@ def resolve_wallet_and_name(raw_input: str) -> tuple[str, str, str]:
                 payload = resp.json()
                 rows = payload.get("data") or [] if isinstance(payload, dict) else (payload or [])
                 for item in rows:
-                    pw = str(item.get("proxyWallet") or item.get("proxy_wallet") or item.get("user") or "").strip()
+                    pw = str(item.get("proxy_wallet") or item.get("proxyWallet") or item.get("user") or "").strip()
                     if EVM_ADDR_RE.match(pw):
                         resolved_wallet = pw
-                        found_name = str(item.get("userName") or handle).strip()
+                        cand = str(item.get("user_name") or item.get("userName") or "").strip()
+                        found_name = cand if _is_valid_profile_name(cand) else handle
                         break
         except Exception:
             pass
@@ -254,8 +325,67 @@ def parse_tournament(title: str) -> str:
     return "Unknown"
 
 
+def _collapse_split_merge_group(g: pd.DataFrame) -> pd.Series:
+    """
+    Cách C: Gộp 2 chân (Yes + No) của cùng 1 market SETTLED_SPLIT_MERGE thành 1 vị thế theo condition_id.
+    Giữ nguyên tổng Volume, tổng PNL thực tế, đồng thời khôi phục đúng số lượng lệnh cho Winrate.
+    """
+    g_sorted = g.sort_values("true_cost", ascending=False)
+    first = g_sorted.iloc[0]
+
+    tot_cost = round(float(g["true_cost"].sum()), 2)
+    tot_realized = round(float(g["realized_pnl"].sum()), 2)
+    tot_unrealized = round(float(g["unrealized_pnl"].sum()), 2)
+    tot_pnl = round(float(g["total_pnl"].sum()), 2)
+    roi = round((tot_pnl / tot_cost) * 100.0, 2) if tot_cost > 0.05 else np.nan
+
+    b_cnt = int(g["buy_count"].sum())
+    s_cnt = int(g["sell_count"].sum())
+    sp_cnt = int(g["split_count"].max())
+    mg_cnt = int(g["merge_count"].max())
+
+    outcomes_held = "+".join(sorted(o for o in g["outcome"].astype(str).unique() if o))
+    tokens_joined = "|".join(sorted(t for t in g["token_id"].astype(str).unique() if t))
+
+    if mg_cnt > 0:
+        exit_st = "MERGED_2_SIDES"
+    elif s_cnt > 0:
+        exit_st = "SPLIT_SOLD_SIDE"
+    else:
+        exit_st = "SPLIT_HOLD"
+
+    w_price = float((g["avg_price"] * g["true_cost"]).sum() / tot_cost) if tot_cost > 0 else 0.5
+    valid_entries = [x for x in g["entry_time_vn"].astype(str).tolist() if x]
+    valid_lasts = [x for x in g["last_time_vn"].astype(str).tolist() if x]
+
+    row = first.copy()
+    row["first_ts"] = g["first_ts"].min()
+    row["last_ts"] = g["last_ts"].max()
+    row["entry_time_vn"] = min(valid_entries) if valid_entries else ""
+    row["last_time_vn"] = max(valid_lasts) if valid_lasts else ""
+    row["token_id"] = tokens_joined
+    row["outcome"] = f"BOTH ({outcomes_held})" if outcomes_held else "BOTH"
+    row["is_hedged"] = True
+    row["avg_price"] = round(w_price, 4)
+    row["true_cost"] = tot_cost
+    row["realized_pnl"] = tot_realized
+    row["unrealized_pnl"] = tot_unrealized
+    row["total_pnl"] = tot_pnl
+    row["roi_pct"] = roi
+    row["is_win"] = bool(tot_pnl > 0)
+    row["buy_count"] = b_cnt
+    row["sell_count"] = s_cnt
+    row["split_count"] = sp_cnt
+    row["merge_count"] = mg_cnt
+    row["avg_clip_usdc"] = round(tot_cost / max(b_cnt + sp_cnt, 1), 2)
+    row["accum_hours"] = round(float(g["accum_hours"].max()), 2)
+    row["hold_hours"] = round(float(g["hold_hours"].max()), 2)
+    row["exit_style"] = exit_st
+    return row
+
+
 def build_backtest_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
-    """Trích xuất sổ cái chuẩn từ /v2/positions & /v2/activity làm nguồn dữ liệu phân tích."""
+    """Trích xuất sổ cái chuẩn theo Cách C từ /v2/positions & /v2/activity."""
     w = wallet.strip()
     raw_positions = []
     for st_val in ("CLOSED", "REDEEMABLE", "REDEEMABLE_LOST", "MERGEABLE", "OPEN"):
@@ -265,7 +395,30 @@ def build_backtest_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
         raw_positions.extend(batch)
 
     if not raw_positions:
-        return pd.DataFrame(), {"volume": 0.0, "pnl": 0.0, "markets": 0, "roi_pct": 0.0}
+        return pd.DataFrame(), {
+            "volume": 0.0,
+            "pnl": 0.0,
+            "markets": 0,
+            "roi_pct": 0.0,
+            "clean_volume": 0.0,
+            "clean_pnl": 0.0,
+            "clean_markets": 0,
+            "clean_roi_pct": 0.0,
+            "clean_winrate": 0.0,
+            "clean_trades": 0,
+            "detected_profile_name": "",
+        }
+
+    # Lớp 5 dự phòng tên profile trực tiếp từ payload API
+    detected_profile_name = ""
+    for item in raw_positions:
+        for k in ("name", "pseudonym", "user_name", "userName"):
+            cand = str(item.get(k) or "").strip()
+            if _is_valid_profile_name(cand):
+                detected_profile_name = cand
+                break
+        if detected_profile_name:
+            break
 
     df = pd.DataFrame(raw_positions)
 
@@ -307,6 +460,16 @@ def build_backtest_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
 
     act_rows = fetch_v2_cursor(ACTIVITY_URL, {"user": w, "limit": 500}, max_pages=150)
     if act_rows:
+        if not detected_profile_name:
+            for item in act_rows[:30]:
+                for k in ("name", "pseudonym", "user_name", "userName"):
+                    cand = str(item.get(k) or "").strip()
+                    if _is_valid_profile_name(cand):
+                        detected_profile_name = cand
+                        break
+                if detected_profile_name:
+                    break
+
         adf = pd.DataFrame(act_rows)
         adf["act_type"] = col(adf, ["type", "activity_type"], "TRADE").astype(str).str.upper()
         adf["act_token"] = col(adf, ["token_id", "asset", "asset_id"], "").astype(str).str.strip()
@@ -490,7 +653,7 @@ def build_backtest_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
         "OPEN",
         np.where(has_split_merge, "SETTLED_SPLIT_MERGE", np.where(is_valid_clob_price, "SETTLED_CLOB", "SETTLED_ESTIMATED")),
     )
-    df["is_backtest_clean"] = is_valid_clob_price
+    df["is_clob_only"] = is_valid_clob_price
     df["is_win"] = df["total_pnl"] > 0
 
     df["roi_pct"] = np.where(
@@ -526,11 +689,30 @@ def build_backtest_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     df["unrealized_pnl"] = df["unrealized_pnl"].round(2)
     df["total_pnl"] = df["total_pnl"].round(2)
 
+    # ======================== ÁP DỤNG CÁCH C: GỘP 2 CHÂN SPLIT/MERGE THEO MARKET ========================
+    sm_mask = (df["record_type"] == "SETTLED_SPLIT_MERGE") & (df["condition_id"] != "")
+    sm_df = df[sm_mask].copy()
+    other_df = df[~sm_mask].copy()
+
+    if not sm_df.empty:
+        collapsed_rows = [
+            _collapse_split_merge_group(grp)
+            for _, grp in sm_df.groupby("condition_id", sort=False)
+        ]
+        sm_collapsed_df = pd.DataFrame(collapsed_rows)
+        df = pd.concat([other_df, sm_collapsed_df], ignore_index=True)
+    else:
+        df = other_df.reset_index(drop=True)
+
+    # Cờ chuẩn Cách C: Bỏ OPEN và SETTLED_ESTIMATED, giữ toàn bộ SETTLED_CLOB + SETTLED_SPLIT_MERGE đã gộp
+    df["is_backtest_clean"] = ~df["record_type"].isin(["OPEN", "SETTLED_ESTIMATED"])
+    df["is_clob_only"] = df["record_type"] == "SETTLED_CLOB"
+
     df = df.sort_values("first_ts", ascending=True, na_position="last").reset_index(drop=True)
 
     cols = [
         "entry_time_vn", "last_time_vn", "month", "status",
-        "record_type", "is_backtest_clean", "cost_source",
+        "record_type", "is_backtest_clean", "is_clob_only", "cost_source",
         "condition_id", "token_id", "title", "outcome",
         "market_type", "tournament", "is_hedged",
         "avg_price", "true_cost", "realized_pnl", "unrealized_pnl", "total_pnl", "roi_pct", "is_win",
@@ -539,16 +721,32 @@ def build_backtest_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     ]
     out_df = df[cols].copy()
 
+    # Thống kê toàn bộ ví (All Ledger)
     vol_1w = float(out_df["true_cost"].sum())
     pnl_net = float(out_df["total_pnl"].sum())
     mkt_cnt = int(out_df[out_df["condition_id"] != ""]["condition_id"].nunique())
     roi_val = (pnl_net / vol_1w * 100.0) if vol_1w > 0 else 0.0
+
+    # Thống kê tập chuẩn Backtest Cách C (is_backtest_clean == True)
+    clean_sub = out_df[out_df["is_backtest_clean"]]
+    clean_vol = float(clean_sub["true_cost"].sum())
+    clean_pnl = float(clean_sub["total_pnl"].sum())
+    clean_mkts = int(clean_sub[clean_sub["condition_id"] != ""]["condition_id"].nunique())
+    clean_roi = (clean_pnl / clean_vol * 100.0) if clean_vol > 0 else 0.0
+    clean_wr = float(clean_sub["is_win"].mean() * 100.0) if not clean_sub.empty else 0.0
 
     summary = {
         "volume": vol_1w,
         "pnl": pnl_net,
         "markets": mkt_cnt,
         "roi_pct": roi_val,
+        "clean_volume": clean_vol,
+        "clean_pnl": clean_pnl,
+        "clean_markets": clean_mkts,
+        "clean_roi_pct": clean_roi,
+        "clean_winrate": clean_wr,
+        "clean_trades": int(len(clean_sub)),
+        "detected_profile_name": detected_profile_name,
     }
     return out_df, summary
 
@@ -560,11 +758,11 @@ col_w, col_n = st.columns([2.2, 1.3])
 wallet_input = col_w.text_input("Địa chỉ ví (0x...) hoặc @username", value=DEFAULT_WALLET)
 custom_name_input = col_n.text_input(
     "Tên file gợi nhớ (tùy chọn)",
-    placeholder="Bỏ trống = tự lấy tên ví",
+    placeholder="Bỏ trống = tự lấy tên profile",
 )
 
 if st.button("⚡ TRÍCH XUẤT CSV", type="primary", use_container_width=True):
-    with st.spinner("Đang định danh ví & đồng bộ dữ liệu..."):
+    with st.spinner("Đang định danh profile & đồng bộ dữ liệu..."):
         try:
             resolved_wallet, auto_name, err_msg = resolve_wallet_and_name(wallet_input)
             if err_msg:
@@ -572,34 +770,54 @@ if st.button("⚡ TRÍCH XUẤT CSV", type="primary", use_container_width=True):
                 st.stop()
 
             ledger_df, summary = build_backtest_ledger(resolved_wallet)
-            ts_tag = datetime.now(VN_TZ).strftime("%Y%m%d_%H%M")
-            st.session_state["backtest_pack"] = (
-                ledger_df,
-                summary,
-                ts_tag,
-                resolved_wallet,
-                auto_name,
-            )
+
+            # Nếu bước đầu chưa lấy được username nhưng payload API có tên profile -> cập nhật lại auto_name
+            api_prof = sanitize_filename_part(summary.get("detected_profile_name", ""))
+            if api_prof and re.match(r"^0x[a-fA-F0-9]{4}_[a-fA-F0-9]{4}$", auto_name):
+                auto_name = api_prof
+                st.session_state.setdefault("wallet_profile_cache", {})[wallet_input.strip().lower()] = (
+                    resolved_wallet,
+                    auto_name,
+                )
+
+            st.session_state["backtest_pack"] = {
+                "ledger_df": ledger_df,
+                "summary": summary,
+                "resolved_wallet": resolved_wallet,
+                "auto_name": auto_name,
+            }
         except Exception as e:
             st.error(f"Lỗi gọi API: {e}")
             st.stop()
 
 if "backtest_pack" in st.session_state:
-    ledger_df, summary, ts_tag, resolved_wallet, auto_name = st.session_state["backtest_pack"]
+    pack = st.session_state["backtest_pack"]
+    ledger_df = pack["ledger_df"]
+    summary = pack["summary"]
+    resolved_wallet = pack["resolved_wallet"]
+    auto_name = pack["auto_name"]
+
     if ledger_df.empty:
         st.warning(f"Không có dữ liệu cho ví `{resolved_wallet}`.")
     else:
-        # Ưu tiên tên bạn tự nhập -> nếu bỏ trống thì tự động dùng username Polymarket hoặc mã ví rút gọn
         final_label = sanitize_filename_part(custom_name_input) or auto_name
         csv_filename = f"{final_label}.csv"
 
-        st.caption(f"Ví đã trích xuất: `{resolved_wallet}` • Định danh file: **{final_label}**")
+        st.caption(f"Ví đã trích xuất: `{resolved_wallet}` • Profile: **{auto_name}** • File xuất: **{csv_filename}**")
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Volume (Mua 1 chiều)", f"${summary['volume']:,.0f}")
         c2.metric("PNL", f"${summary['pnl']:+,.2f}")
         c3.metric("Market", f"{summary['markets']:,}")
         c4.metric("ROI", f"{summary['roi_pct']:+.3f}%")
+
+        st.info(
+            f"📊 **Tập chuẩn Backtest (Cách C — `is_backtest_clean = True`):** "
+            f"**{summary['clean_trades']:,}** lệnh ({summary['clean_markets']:,} markets) • "
+            f"Winrate: **{summary['clean_winrate']:.2f}%** • "
+            f"PNL: **${summary['clean_pnl']:+,.2f}** • "
+            f"ROI: **{summary['clean_roi_pct']:+.3f}%**"
+        )
 
         st.download_button(
             label=f"📥 TẢI FILE CSV ({csv_filename})",
