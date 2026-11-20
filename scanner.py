@@ -115,7 +115,9 @@ def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     """
     Xây dựng 1 bảng sổ cái nguyên tử duy nhất (Single Source of Truth) từ /v2/positions & /v2/activity:
     - Khớp 100% số lượng market và tổng PnL thực tế sau phí Taker (realized_pnl + unrealized_pnl).
-    - Gắn sẵn cờ `record_type` & `is_backtest_clean` để AI lọc sạch chỉ bằng 1 dòng pandas.
+    - Fix 1: Khôi phục vốn gốc thật khi bán sớm (tránh số dư bụi $0.01 làm ROI nhảy nghìn %).
+    - Fix 2: Giữ toàn bộ kèo SPLIT/MERGE trong sổ cái để không lọt lỗ/lãi, nhưng tách khỏi `is_backtest_clean`.
+    - Fix 3: Kèo hòa vốn sau phí (`total_pnl <= 0`) được tính là `is_win = False`.
     """
     w = wallet.strip()
     raw_positions = []
@@ -267,42 +269,47 @@ def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     for c in ("act_buy_usdc", "act_buy_shares", "act_sell_usdc", "split_usdc", "split_shares", "merge_usdc"):
         df[c] = df[c].fillna(0.0)
 
-    # Khôi phục vốn gốc theo thứ tự tin cậy & gắn nhãn nguồn vốn minh bạch
+    # ======================== FIX 1: KHÔI PHỤC VỐN GỐC THẬT KHI BÁN SỚM ========================
+    clob_cost = np.maximum(df["entry_cost_usdc"], df["act_buy_usdc"])
     split_side_cost = np.where(df["split_usdc"] > 0, df["split_usdc"] * 0.5, df["split_shares"] * 0.5)
-    can_imply_cost = (
-        (df["avg_price"] > 0.001)
+
+    can_imply_win_cost = (
+        (clob_cost <= 0.05)
+        & (split_side_cost <= 0)
+        & (df["avg_price"] > 0.001)
         & (df["avg_price"] < 0.999)
         & (df["realized_pnl"] > 0)
-        & (df["sell_count"] == 0)
+        & (df["merge_count"] == 0)
+    )
+    can_imply_loss_cost = (
+        (clob_cost <= 0.05)
+        & (split_side_cost <= 0)
+        & (df["realized_pnl"] < 0)
         & (df["merge_count"] == 0)
     )
     implied_cost_val = np.where(
-        can_imply_cost,
+        can_imply_win_cost,
         df["realized_pnl"] * df["avg_price"] / (1.0 - df["avg_price"]),
-        0.0,
+        np.where(can_imply_loss_cost, df["realized_pnl"].abs(), 0.0),
     )
 
     df["true_cost"] = np.where(
-        df["entry_cost_usdc"] > 0,
-        df["entry_cost_usdc"],
+        clob_cost > 0.05,
+        clob_cost,
         np.where(
-            df["act_buy_usdc"] > 0,
-            df["act_buy_usdc"],
-            np.where(split_side_cost > 0, split_side_cost, implied_cost_val),
+            split_side_cost > 0,
+            split_side_cost,
+            np.where(implied_cost_val > 0.05, implied_cost_val, clob_cost),
         ),
     )
 
     df["cost_source"] = np.where(
-        df["entry_cost_usdc"] > 0,
-        "POSITIONS_API",
+        clob_cost > 0.05,
+        np.where(df["act_buy_usdc"] >= df["entry_cost_usdc"], "ACTIVITY_TRADE", "POSITIONS_API"),
         np.where(
-            df["act_buy_usdc"] > 0,
-            "ACTIVITY_TRADE",
-            np.where(
-                split_side_cost > 0,
-                "ACTIVITY_SPLIT",
-                np.where(can_imply_cost, "IMPLIED_FROM_PNL", "UNAVAILABLE"),
-            ),
+            split_side_cost > 0,
+            "ACTIVITY_SPLIT",
+            np.where(implied_cost_val > 0.05, "IMPLIED_FROM_PNL", "UNAVAILABLE"),
         ),
     )
 
@@ -348,13 +355,14 @@ def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     df["last_time_vn"] = dt_last.dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
     df["month"] = dt_first.dt.strftime("%Y-%m").fillna("Unknown")
 
-    # Phân loại bản ghi ngay trên 1 bảng duy nhất để AI lọc chuẩn xác
+    # ======================== FIX 2: TÁCH TẦNG SPLIT/MERGE KHỎI BACKTEST GIÁ ========================
     is_open = df["status"] == "OPEN"
     has_split_merge = (df["split_count"] > 0) | (df["merge_count"] > 0) | (df["cost_source"] == "ACTIVITY_SPLIT")
     is_valid_clob_price = (
         (~is_open)
+        & (~has_split_merge)
         & (df["cost_source"].isin(["POSITIONS_API", "ACTIVITY_TRADE"]))
-        & (df["true_cost"] > 0.01)
+        & (df["true_cost"] > 0.05)
         & (df["avg_price"] > 0.0)
         & (df["avg_price"] <= 1.0)
     )
@@ -368,24 +376,34 @@ def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
             np.where(is_valid_clob_price, "SETTLED_CLOB", "SETTLED_ESTIMATED"),
         ),
     )
-    # Cờ boolean để AI lọc tập chuẩn backtest giá chỉ với 1 điều kiện df[df["is_backtest_clean"]]
     df["is_backtest_clean"] = is_valid_clob_price
 
-    # Kết quả & chỉ số tài chính
-    df["is_win"] = np.where(
-        df["status"] == "REDEEMABLE",
-        True,
-        np.where(df["status"] == "REDEEMABLE_LOST", False, df["total_pnl"] > 0),
-    )
-    df["roi_pct"] = np.where(df["true_cost"] > 0.01, (df["total_pnl"] / df["true_cost"]) * 100.0, 0.0).round(2)
-    df["avg_clip_usdc"] = np.where(df["buy_count"] > 0, df["true_cost"] / df["buy_count"], df["true_cost"]).round(2)
+    # ======================== FIX 3: KÈO HÒA VỐN SAU PHÍ TÍNH LÀ LỖ (is_win = False) ========================
+    df["is_win"] = df["total_pnl"] > 0
+
+    df["roi_pct"] = np.where(
+        (df["true_cost"] > 0.05) & (df["cost_source"] != "UNAVAILABLE"),
+        (df["total_pnl"] / df["true_cost"]) * 100.0,
+        np.nan,
+    ).round(2)
+
+    df["avg_clip_usdc"] = np.where(
+        df["buy_count"] > 0,
+        df["true_cost"] / df["buy_count"],
+        df["true_cost"],
+    ).round(2)
+
     df["exit_style"] = np.where(
         df["merge_count"] > 0,
         "MERGED_2_SIDES",
         np.where(
-            df["sell_count"] == 0,
-            "HOLD_TO_EXPIRY",
-            np.where(df["act_sell_usdc"] >= df["true_cost"] * 0.8, "SOLD_EARLY", "PARTIAL_SELL"),
+            df["split_count"] > 0,
+            np.where(df["sell_count"] > 0, "SPLIT_SOLD_SIDE", "SPLIT_HOLD"),
+            np.where(
+                df["sell_count"] == 0,
+                "HOLD_TO_EXPIRY",
+                np.where(df["act_sell_usdc"] >= df["true_cost"] * 0.8, "SOLD_EARLY", "PARTIAL_SELL"),
+            ),
         ),
     )
 
@@ -417,11 +435,15 @@ def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     out_df = df[canonical_cols].copy()
 
     clean_sub = out_df[out_df["is_backtest_clean"]]
+    sm_sub = out_df[out_df["record_type"] == "SETTLED_SPLIT_MERGE"]
     audit_meta = {
         "total_rows": len(out_df),
         "total_unique_markets": int(out_df[out_df["condition_id"] != ""]["condition_id"].nunique()),
         "clean_rows": len(clean_sub),
         "clean_pnl": float(clean_sub["total_pnl"].sum()),
+        "sm_rows": len(sm_sub),
+        "sm_markets": int(sm_sub[sm_sub["condition_id"] != ""]["condition_id"].nunique()),
+        "sm_pnl": float(sm_sub["total_pnl"].sum()),
         "wallet_total_pnl": float(out_df["total_pnl"].sum()),
         "one_way_cost_all": float(out_df["true_cost"].sum()),
         "two_way_activity_vol": total_two_way_vol,
@@ -469,9 +491,9 @@ if "canonical_pack" in st.session_state:
             "Khớp tiền mặt thực tế",
         )
         c4.metric(
-            "Tập Sạch Backtest Giá",
-            f"{audit_meta['clean_rows']:,} kèo",
-            f"PnL: ${audit_meta['clean_pnl']:+,.2f}",
+            "Nhóm Split / Merge",
+            f"${audit_meta['sm_pnl']:+,.2f}",
+            f"{audit_meta['sm_markets']} markets ({audit_meta['sm_rows']} dòng)",
         )
 
         # Bảng tóm tắt cấu trúc 4 tầng bên trong file CSV duy nhất
@@ -480,6 +502,7 @@ if "canonical_pack" in st.session_state:
             .agg(
                 so_dong=("total_pnl", "count"),
                 so_market=("condition_id", "nunique"),
+                thang=("is_win", "sum"),
                 von_goc=("true_cost", "sum"),
                 pnl_rong=("total_pnl", "sum"),
             )
@@ -489,6 +512,7 @@ if "canonical_pack" in st.session_state:
                     "is_backtest_clean": "Dùng Backtest Giá",
                     "so_dong": "Số dòng",
                     "so_market": "Số Market",
+                    "thang": "Số Win (>0$)",
                     "von_goc": "Vốn gốc ($)",
                     "pnl_rong": "PnL ròng ($)",
                 }
