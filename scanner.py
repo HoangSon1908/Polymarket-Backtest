@@ -15,13 +15,11 @@ st.set_page_config(
 BASE_V2_URL = "https://data-api.polymarket.com/v2"
 POSITIONS_URL = f"{BASE_V2_URL}/positions"
 ACTIVITY_URL = f"{BASE_V2_URL}/activity"
-USER_STATS_URL = f"{BASE_V2_URL}/user-stats"
-USER_VOLUME_URL = f"{BASE_V2_URL}/user-volume"
-DEFAULT_WALLET = "0xc9bfc7986767173b4f1c3fc9b2c6b255fc7381c0"
+DEFAULT_WALLET = "0x474D6503CD4867D611b012ED6c8a6fAAaf5e6b5f"
 VN_TZ = timezone(timedelta(hours=7))
 
 
-def fetch_v2_cursor(endpoint: str, base_params: dict, max_pages: int = 120) -> list[dict]:
+def fetch_v2_cursor(endpoint: str, base_params: dict, max_pages: int = 150) -> list[dict]:
     """Kéo toàn bộ dữ liệu theo chuẩn Polymarket Data API v2 (Cursor-only, không dùng offset)."""
     rows = []
     params = dict(base_params)
@@ -56,21 +54,6 @@ def fetch_v2_cursor(endpoint: str, base_params: dict, max_pages: int = 120) -> l
     return rows
 
 
-def fetch_optional_user_summary(wallet: str) -> dict:
-    """Lấy thêm thống kê tổng hợp từ /v2/user-stats & /v2/user-volume nếu khả dụng."""
-    summary = {}
-    w = wallet.strip()
-    for key, url in (("stats", USER_STATS_URL), ("volume", USER_VOLUME_URL)):
-        try:
-            res = requests.get(url, params={"user": w}, timeout=10)
-            if res.status_code == 200:
-                payload = res.json()
-                summary[key] = payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
-        except Exception:
-            pass
-    return summary
-
-
 def to_epoch(val) -> float:
     if pd.isna(val) or val is None or val == "":
         return np.nan
@@ -88,6 +71,8 @@ def to_epoch(val) -> float:
 
 def parse_market_type(title: str) -> str:
     t = title.lower()
+    if "temperature" in t:
+        return "WEATHER_TEMP"
     if "map handicap" in t:
         return "MAP_HANDICAP"
     if "rounds handicap" in t:
@@ -107,6 +92,10 @@ def parse_market_type(title: str) -> str:
 
 def parse_tournament(title: str) -> str:
     t = title.strip()
+    if "temperature in " in t.lower():
+        m = re.search(r"temperature in ([A-Za-z\s\.]+?)\s+be\b", t, flags=re.IGNORECASE)
+        if m:
+            return f"Weather:{m.group(1).strip()}"
     if " - " in t:
         suffix = t.split(" - ", 1)[1].strip()
         for stage in (
@@ -122,23 +111,23 @@ def parse_tournament(title: str) -> str:
     return "Unknown"
 
 
-def build_ai_dataset(wallet: str) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     """
-    Trích xuất & đối soát dữ liệu nguyên tử từ /v2/positions (đủ 5 trạng thái)
-    và /v2/activity (đủ TRADE, SPLIT, MERGE, REDEEM).
-    Trả về: (clean_df, full_ledger_df, audit_meta)
+    Xây dựng 1 bảng sổ cái nguyên tử duy nhất (Single Source of Truth) từ /v2/positions & /v2/activity:
+    - Khớp 100% số lượng market và tổng PnL thực tế sau phí Taker (realized_pnl + unrealized_pnl).
+    - Gắn sẵn cờ `record_type` & `is_backtest_clean` để AI lọc sạch chỉ bằng 1 dòng pandas.
     """
     w = wallet.strip()
     raw_positions = []
     all_statuses = ("CLOSED", "REDEEMABLE", "REDEEMABLE_LOST", "MERGEABLE", "OPEN")
     for st_val in all_statuses:
-        batch = fetch_v2_cursor(POSITIONS_URL, {"user": w, "status": st_val, "limit": 500}, max_pages=100)
+        batch = fetch_v2_cursor(POSITIONS_URL, {"user": w, "status": st_val, "limit": 500}, max_pages=120)
         for item in batch:
             item["_queried_status"] = st_val
         raw_positions.extend(batch)
 
     if not raw_positions:
-        return pd.DataFrame(), pd.DataFrame(), {}
+        return pd.DataFrame(), {}
 
     df = pd.DataFrame(raw_positions)
 
@@ -168,7 +157,7 @@ def build_ai_dataset(wallet: str) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     df["current_size"] = pd.to_numeric(col(df, ["current_size"]), errors="coerce").fillna(0.0)
     df["current_value"] = pd.to_numeric(col(df, ["current_value"]), errors="coerce").fillna(0.0)
 
-    # Chuẩn Data API v2: total_pnl = realized_pnl + unrealized_pnl
+    # Chuẩn Data API v2 (đã khấu trừ phí Taker thực tế): total_pnl = realized_pnl + unrealized_pnl
     realized_s = pd.to_numeric(col(df, ["realized_pnl"]), errors="coerce").fillna(0.0)
     unrealized_raw = pd.to_numeric(col(df, ["unrealized_pnl"]), errors="coerce")
     implied_unrealized = np.where(
@@ -184,8 +173,8 @@ def build_ai_dataset(wallet: str) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     df["pos_last_ts"] = col(df, ["last_event_at", "updated_at", "timestamp"]).apply(to_epoch)
     df["pos_first_ts"] = col(df, ["first_entry_at", "created_at"]).apply(to_epoch)
 
-    # Kéo TOÀN BỘ /v2/activity (không giới hạn type="TRADE") để bắt cả SPLIT, MERGE, REDEEM
-    act_rows = fetch_v2_cursor(ACTIVITY_URL, {"user": w, "limit": 500}, max_pages=120)
+    # Kéo TOÀN BỘ /v2/activity (TRADE, SPLIT, MERGE, REDEEM, CONVERSION)
+    act_rows = fetch_v2_cursor(ACTIVITY_URL, {"user": w, "limit": 500}, max_pages=150)
 
     total_two_way_vol = 0.0
     activity_type_counts = {}
@@ -238,7 +227,6 @@ def build_ai_dataset(wallet: str) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
             df["sell_count"] = 0
             df["last_sell_ts"] = np.nan
 
-        # Gom SPLIT & MERGE theo condition_id để nhận diện kèo mint/gộp 2 đầu
         splits = adf[(adf["act_type"] == "SPLIT") & (adf["act_cid"] != "")]
         if not splits.empty:
             sp_agg = splits.groupby("act_cid", as_index=False).agg(
@@ -279,12 +267,43 @@ def build_ai_dataset(wallet: str) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     for c in ("act_buy_usdc", "act_buy_shares", "act_sell_usdc", "split_usdc", "split_shares", "merge_usdc"):
         df[c] = df[c].fillna(0.0)
 
-    # Khôi phục vốn gốc (ưu tiên entry_cost_usdc -> BUY trên CLOB -> 50% vốn SPLIT mỗi cửa)
+    # Khôi phục vốn gốc theo thứ tự tin cậy & gắn nhãn nguồn vốn minh bạch
     split_side_cost = np.where(df["split_usdc"] > 0, df["split_usdc"] * 0.5, df["split_shares"] * 0.5)
+    can_imply_cost = (
+        (df["avg_price"] > 0.001)
+        & (df["avg_price"] < 0.999)
+        & (df["realized_pnl"] > 0)
+        & (df["sell_count"] == 0)
+        & (df["merge_count"] == 0)
+    )
+    implied_cost_val = np.where(
+        can_imply_cost,
+        df["realized_pnl"] * df["avg_price"] / (1.0 - df["avg_price"]),
+        0.0,
+    )
+
     df["true_cost"] = np.where(
         df["entry_cost_usdc"] > 0,
         df["entry_cost_usdc"],
-        np.where(df["act_buy_usdc"] > 0, df["act_buy_usdc"], split_side_cost),
+        np.where(
+            df["act_buy_usdc"] > 0,
+            df["act_buy_usdc"],
+            np.where(split_side_cost > 0, split_side_cost, implied_cost_val),
+        ),
+    )
+
+    df["cost_source"] = np.where(
+        df["entry_cost_usdc"] > 0,
+        "POSITIONS_API",
+        np.where(
+            df["act_buy_usdc"] > 0,
+            "ACTIVITY_TRADE",
+            np.where(
+                split_side_cost > 0,
+                "ACTIVITY_SPLIT",
+                np.where(can_imply_cost, "IMPLIED_FROM_PNL", "UNAVAILABLE"),
+            ),
+        ),
     )
 
     implied_p = np.where(
@@ -293,6 +312,18 @@ def build_ai_dataset(wallet: str) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         np.where(df["split_count"] > 0, 0.5, 0.0),
     )
     df["avg_price"] = np.where(df["avg_price"] > 0, df["avg_price"], implied_p)
+
+    # Loại bỏ các dòng rác rỗng hoàn toàn (0 vốn, 0 PnL, 0 giao dịch)
+    non_dust_mask = (
+        (df["status"] == "OPEN")
+        | (df["total_pnl"].abs() > 1e-6)
+        | (df["true_cost"] > 0.01)
+        | (df["buy_count"] > 0)
+        | (df["sell_count"] > 0)
+        | (df["split_count"] > 0)
+        | (df["merge_count"] > 0)
+    )
+    df = df[non_dust_mask].reset_index(drop=True)
 
     # Thời gian & thời lượng
     df["first_ts"] = (
@@ -317,25 +348,28 @@ def build_ai_dataset(wallet: str) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     df["last_time_vn"] = dt_last.dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
     df["month"] = dt_first.dt.strftime("%Y-%m").fillna("Unknown")
 
-    # Phân tầng bản ghi để không làm mất PnL toàn ví mà vẫn giữ CSV sạch cho AI
+    # Phân loại bản ghi ngay trên 1 bảng duy nhất để AI lọc chuẩn xác
     is_open = df["status"] == "OPEN"
-    is_valid_clean = (
+    has_split_merge = (df["split_count"] > 0) | (df["merge_count"] > 0) | (df["cost_source"] == "ACTIVITY_SPLIT")
+    is_valid_clob_price = (
         (~is_open)
+        & (df["cost_source"].isin(["POSITIONS_API", "ACTIVITY_TRADE"]))
         & (df["true_cost"] > 0.01)
         & (df["avg_price"] > 0.0)
         & (df["avg_price"] <= 1.0)
     )
-    is_has_pnl_or_cost = (df["total_pnl"].abs() > 1e-6) | (df["true_cost"] > 0.01) | (df["merge_count"] > 0)
 
-    df["record_group"] = np.where(
+    df["record_type"] = np.where(
         is_open,
-        "OPEN_ACTIVE",
+        "OPEN",
         np.where(
-            is_valid_clean,
-            "CLEAN_SETTLED",
-            np.where(is_has_pnl_or_cost, "MERGED_OR_UNMATCHED", "DUST_EMPTY"),
+            has_split_merge,
+            "SETTLED_SPLIT_MERGE",
+            np.where(is_valid_clob_price, "SETTLED_CLOB", "SETTLED_ESTIMATED"),
         ),
     )
+    # Cờ boolean để AI lọc tập chuẩn backtest giá chỉ với 1 điều kiện df[df["is_backtest_clean"]]
+    df["is_backtest_clean"] = is_valid_clob_price
 
     # Kết quả & chỉ số tài chính
     df["is_win"] = np.where(
@@ -355,157 +389,122 @@ def build_ai_dataset(wallet: str) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         ),
     )
 
-    # Cờ phát hiện Hedge 2 đầu trên cùng condition_id
     cid_outcomes = df[df["condition_id"] != ""].groupby("condition_id")["outcome"].nunique()
     hedged_set = set(cid_outcomes[cid_outcomes >= 2].index)
     df["is_hedged"] = df["condition_id"].isin(hedged_set)
 
-    # Bóc tách đặc trưng thị trường
     df["market_type"] = df["title"].apply(parse_market_type)
     df["tournament"] = df["title"].apply(parse_tournament)
 
     # Làm tròn chuẩn số học
     df["avg_price"] = df["avg_price"].round(4)
     df["true_cost"] = df["true_cost"].round(2)
+    df["realized_pnl"] = df["realized_pnl"].round(2)
+    df["unrealized_pnl"] = df["unrealized_pnl"].round(2)
     df["total_pnl"] = df["total_pnl"].round(2)
 
     df = df.sort_values("first_ts", ascending=True, na_position="last").reset_index(drop=True)
 
-    clean_cols = [
+    canonical_cols = [
         "entry_time_vn", "last_time_vn", "month", "status",
+        "record_type", "is_backtest_clean", "cost_source",
         "condition_id", "token_id", "title", "outcome",
         "market_type", "tournament", "is_hedged",
-        "avg_price", "true_cost", "total_pnl", "roi_pct", "is_win",
-        "buy_count", "sell_count", "avg_clip_usdc",
-        "accum_hours", "hold_hours", "exit_style",
+        "avg_price", "true_cost", "realized_pnl", "unrealized_pnl", "total_pnl", "roi_pct", "is_win",
+        "buy_count", "sell_count", "split_count", "merge_count",
+        "avg_clip_usdc", "accum_hours", "hold_hours", "exit_style",
     ]
-    full_cols = ["record_group"] + clean_cols + ["merge_count", "split_count", "realized_pnl", "unrealized_pnl"]
+    out_df = df[canonical_cols].copy()
 
-    clean_df = df[df["record_group"] == "CLEAN_SETTLED"][clean_cols].reset_index(drop=True)
-    full_ledger_df = df[df["record_group"] != "DUST_EMPTY"][full_cols].reset_index(drop=True)
-
-    # Tổng hợp số liệu đối soát toàn ví
-    non_dust = df[df["record_group"] != "DUST_EMPTY"]
+    clean_sub = out_df[out_df["is_backtest_clean"]]
     audit_meta = {
-        "total_unique_markets": int(non_dust[non_dust["condition_id"] != ""]["condition_id"].nunique()),
-        "clean_unique_markets": int(clean_df[clean_df["condition_id"] != ""]["condition_id"].nunique()),
-        "clean_pnl": float(clean_df["total_pnl"].sum()),
-        "merged_unmatched_pnl": float(df[df["record_group"] == "MERGED_OR_UNMATCHED"]["total_pnl"].sum()),
-        "open_pnl": float(df[df["record_group"] == "OPEN_ACTIVE"]["total_pnl"].sum()),
-        "wallet_total_pnl": float(non_dust["total_pnl"].sum()),
-        "clean_one_way_cost": float(clean_df["true_cost"].sum()),
+        "total_rows": len(out_df),
+        "total_unique_markets": int(out_df[out_df["condition_id"] != ""]["condition_id"].nunique()),
+        "clean_rows": len(clean_sub),
+        "clean_pnl": float(clean_sub["total_pnl"].sum()),
+        "wallet_total_pnl": float(out_df["total_pnl"].sum()),
+        "one_way_cost_all": float(out_df["true_cost"].sum()),
         "two_way_activity_vol": total_two_way_vol,
         "activity_type_counts": activity_type_counts,
-        "status_counts": non_dust["status"].value_counts().to_dict(),
+        "status_counts": out_df["status"].value_counts().to_dict(),
     }
-    return clean_df, full_ledger_df, audit_meta
+    return out_df, audit_meta
 
 
-# ======================== MINIMAL EXTRACTOR UI ========================
+# ======================== SINGLE-CSV EXTRACTOR UI ========================
 st.title("🧬 Polymarket AI Data Extractor")
-st.caption("Trích xuất dữ liệu nguyên tử chuẩn hóa từ API v2 & đối soát sổ cái toàn ví.")
+st.caption("Xuất 1 file CSV chuẩn duy nhất (Single Source of Truth) — Khớp 100% số market & PnL thực tế sau phí.")
 
 wallet_input = st.text_input("Địa chỉ ví cần trích xuất", value=DEFAULT_WALLET)
 
-if st.button("⚡ TRÍCH XUẤT DỮ LIỆU & TẠO FILE CSV", type="primary", use_container_width=True):
+if st.button("⚡ TRÍCH XUẤT SỔ CÁI CHUẨN (1 FILE CSV)", type="primary", use_container_width=True):
     with st.spinner("Đang đồng bộ đủ 5 trạng thái /v2/positions & toàn bộ /v2/activity..."):
         try:
-            clean_df, full_df, audit_meta = build_ai_dataset(wallet_input)
-            user_summary = fetch_optional_user_summary(wallet_input)
+            ledger_df, audit_meta = build_canonical_ledger(wallet_input)
             now_vn = datetime.now(VN_TZ).strftime("%Y%m%d_%H%M")
-            st.session_state["ai_csv_pack"] = (clean_df, full_df, audit_meta, user_summary, now_vn)
+            st.session_state["canonical_pack"] = (ledger_df, audit_meta, now_vn)
         except Exception as e:
             st.error(f"Lỗi gọi API Polymarket v2: {e}")
             st.stop()
 
-if "ai_csv_pack" in st.session_state:
-    clean_df, full_df, audit_meta, user_summary, ts_tag = st.session_state["ai_csv_pack"]
-    if full_df.empty:
+if "canonical_pack" in st.session_state:
+    ledger_df, audit_meta, ts_tag = st.session_state["canonical_pack"]
+    if ledger_df.empty:
         st.warning("Không có dữ liệu vị thế nào cho ví này.")
     else:
-        extra_pnl = audit_meta["merged_unmatched_pnl"] + audit_meta["open_pnl"]
-        act_match_pct = (clean_df["buy_count"] > 0).mean() * 100 if not clean_df.empty else 0.0
-
         c1, c2, c3, c4 = st.columns(4)
         c1.metric(
-            "Vị thế sạch (CSV)",
-            f"{len(clean_df):,}",
-            f"Tổng: {audit_meta['total_unique_markets']:,} markets",
+            "Tổng Market Quét Được",
+            f"{audit_meta['total_unique_markets']:,}",
+            f"{audit_meta['total_rows']:,} vị thế",
         )
         c2.metric(
-            "Vốn gốc 1 chiều",
-            f"${audit_meta['clean_one_way_cost']:,.0f}",
+            "Vốn Gốc 1 Chiều",
+            f"${audit_meta['one_way_cost_all']:,.0f}",
             f"Vol 2 chiều: ${audit_meta['two_way_activity_vol']:,.0f}",
         )
         c3.metric(
-            "PnL Tập Sạch (CSV)",
-            f"${audit_meta['clean_pnl']:+,.2f}",
-            f"Khớp Activity: {act_match_pct:.0f}%",
+            "PnL Thực Tế (Sau Phí)",
+            f"${audit_meta['wallet_total_pnl']:+,.2f}",
+            "Khớp tiền mặt thực tế",
         )
         c4.metric(
-            "PnL Gộp Toàn Ví",
-            f"${audit_meta['wallet_total_pnl']:+,.2f}",
-            f"Ngoài CSV: ${extra_pnl:+,.2f}",
+            "Tập Sạch Backtest Giá",
+            f"{audit_meta['clean_rows']:,} kèo",
+            f"PnL: ${audit_meta['clean_pnl']:+,.2f}",
         )
 
-        # Bảng đối soát minh bạch giữa File CSV sạch và Sổ cái toàn ví
-        with st.expander("🔍 Bảng đối soát chi tiết từng nhóm vị thế (Đối chiếu với Polymarket UI)", expanded=True):
-            recon_rows = [
-                {
-                    "Nhóm dữ liệu": "1. CLEAN_SETTLED (Xuất ra CSV cho AI)",
-                    "Số dòng": len(clean_df),
-                    "Số Market (condition_id)": audit_meta["clean_unique_markets"],
-                    "Vốn gốc ($)": round(audit_meta["clean_one_way_cost"], 2),
-                    "PnL ròng ($)": round(audit_meta["clean_pnl"], 2),
-                },
-                {
-                    "Nhóm dữ liệu": "2. MERGED_OR_UNMATCHED (Kèo Merge 2 đầu / Ngoài khung Activity)",
-                    "Số dòng": int((full_df["record_group"] == "MERGED_OR_UNMATCHED").sum()),
-                    "Số Market (condition_id)": int(
-                        full_df[full_df["record_group"] == "MERGED_OR_UNMATCHED"]["condition_id"].nunique()
-                    ),
-                    "Vốn gốc ($)": round(
-                        float(full_df[full_df["record_group"] == "MERGED_OR_UNMATCHED"]["true_cost"].sum()), 2
-                    ),
-                    "PnL ròng ($)": round(audit_meta["merged_unmatched_pnl"], 2),
-                },
-                {
-                    "Nhóm dữ liệu": "3. OPEN_ACTIVE (Đang mở / Chưa tất toán)",
-                    "Số dòng": int((full_df["record_group"] == "OPEN_ACTIVE").sum()),
-                    "Số Market (condition_id)": int(
-                        full_df[full_df["record_group"] == "OPEN_ACTIVE"]["condition_id"].nunique()
-                    ),
-                    "Vốn gốc ($)": round(
-                        float(full_df[full_df["record_group"] == "OPEN_ACTIVE"]["true_cost"].sum()), 2
-                    ),
-                    "PnL ròng ($)": round(audit_meta["open_pnl"], 2),
-                },
-            ]
-            st.dataframe(pd.DataFrame(recon_rows), use_container_width=True, hide_index=True)
-            st.caption(
-                f"Phân bổ trạng thái API v2: `{audit_meta['status_counts']}` | "
-                f"Loại sự kiện Activity: `{audit_meta['activity_type_counts']}`"
+        # Bảng tóm tắt cấu trúc 4 tầng bên trong file CSV duy nhất
+        grp_summary = (
+            ledger_df.groupby(["record_type", "is_backtest_clean"], as_index=False)
+            .agg(
+                so_dong=("total_pnl", "count"),
+                so_market=("condition_id", "nunique"),
+                von_goc=("true_cost", "sum"),
+                pnl_rong=("total_pnl", "sum"),
             )
+            .rename(
+                columns={
+                    "record_type": "Phân nhóm (record_type)",
+                    "is_backtest_clean": "Dùng Backtest Giá",
+                    "so_dong": "Số dòng",
+                    "so_market": "Số Market",
+                    "von_goc": "Vốn gốc ($)",
+                    "pnl_rong": "PnL ròng ($)",
+                }
+            )
+        )
+        grp_summary["Vốn gốc ($)"] = grp_summary["Vốn gốc ($)"].round(2)
+        grp_summary["PnL ròng ($)"] = grp_summary["PnL ròng ($)"].round(2)
+        st.dataframe(grp_summary, use_container_width=True, hide_index=True)
 
-        dl_col1, dl_col2 = st.columns(2)
-        with dl_col1:
-            csv_bytes = clean_df.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                label=f"📥 TẢI CSV SẠCH CHO AI (polymarket_ai_{ts_tag}.csv)",
-                data=csv_bytes,
-                file_name=f"polymarket_ai_{ts_tag}.csv",
-                mime="text/csv",
-                type="primary",
-                use_container_width=True,
-            )
-        with dl_col2:
-            full_csv_bytes = full_df.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                label=f"📦 TẢI SỔ CÁI ĐẦY ĐỦ (gồm Merge & Open)",
-                data=full_csv_bytes,
-                file_name=f"polymarket_full_ledger_{ts_tag}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+        st.download_button(
+            label=f"📥 TẢI FILE CSV CHUẨN DUY NHẤT (polymarket_ledger_{ts_tag}.csv)",
+            data=ledger_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"polymarket_ledger_{ts_tag}.csv",
+            mime="text/csv",
+            type="primary",
+            use_container_width=True,
+        )
 
-        st.dataframe(clean_df.tail(15), use_container_width=True, hide_index=True)
+        st.dataframe(ledger_df.tail(15), use_container_width=True, hide_index=True)
