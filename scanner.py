@@ -16,6 +16,7 @@ BASE_V2_URL = "https://data-api.polymarket.com/v2"
 POSITIONS_URL = f"{BASE_V2_URL}/positions"
 ACTIVITY_URL = f"{BASE_V2_URL}/activity"
 DEFAULT_WALLET = "0x474D6503CD4867D611b012ED6c8a6fAAaf5e6b5f"
+DEFAULT_ACCOUNT = "HoangSon2"
 VN_TZ = timezone(timedelta(hours=7))
 
 
@@ -109,6 +110,22 @@ def parse_tournament(title: str) -> str:
     if any(k in t.lower() for k in ("handicap", "map 1", "map 2", "map 3", "games total")):
         return "Side_Market"
     return "Unknown"
+
+
+def build_csv_filename(wallet: str, account_name: str = "") -> str:
+    """Trả về tên file theo công thức `<tên tài khoản>.csv` (vd: `hoangson2.csv`)."""
+    raw = (account_name or "").strip().lstrip("@")
+    if not raw:
+        w = (wallet or "").strip()
+        if w and not w.lower().startswith("0x"):
+            raw = w.lstrip("@")
+        elif w.lower().startswith("0x") and len(w) >= 10:
+            raw = f"wallet_{w[2:10].lower()}"
+        else:
+            raw = "account"
+
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", raw).strip("_").lower()
+    return f"{slug or 'account'}.csv"
 
 
 def build_backtest_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
@@ -414,32 +431,33 @@ def build_backtest_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
 st.title("🧬 Polymarket Backtest Extractor")
 
 wallet_input = st.text_input("Địa chỉ ví", value=DEFAULT_WALLET)
+account_input = st.text_input("Tên tài khoản", value=DEFAULT_ACCOUNT)
 
 if st.button("⚡ TRÍCH XUẤT CSV", type="primary", use_container_width=True):
     with st.spinner("Đang đồng bộ dữ liệu..."):
         try:
             ledger_df, summary = build_backtest_ledger(wallet_input)
-            ts_tag = datetime.now(VN_TZ).strftime("%Y%m%d_%H%M")
-            st.session_state["backtest_pack"] = (ledger_df, summary, ts_tag)
+            csv_filename = build_csv_filename(wallet_input, account_input)
+            st.session_state["backtest_pack"] = (ledger_df, summary, csv_filename)
         except Exception as e:
             st.error(f"Lỗi gọi API: {e}")
             st.stop()
 
 if "backtest_pack" in st.session_state:
-    ledger_df, summary, ts_tag = st.session_state["backtest_pack"]
+    ledger_df, summary, csv_filename = st.session_state["backtest_pack"]
     if ledger_df.empty:
         st.warning("Không có dữ liệu cho ví này.")
     else:
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Volume (Mua 1 chiều)", f"${summary['volume']:,.0f}")
+        c1.metric("Volume", f"${summary['volume']:,.0f}")
         c2.metric("PNL", f"${summary['pnl']:+,.2f}")
         c3.metric("Market", f"{summary['markets']:,}")
         c4.metric("ROI", f"{summary['roi_pct']:+.3f}%")
 
         st.download_button(
-            label=f"📥 TẢI FILE CSV (polymarket_backtest_{ts_tag}.csv)",
+            label=f"📥 TẢI FILE CSV ({csv_filename})",
             data=ledger_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"polymarket_backtest_{ts_tag}.csv",
+            file_name=csv_filename,
             mime="text/csv",
             type="primary",
             use_container_width=True,
