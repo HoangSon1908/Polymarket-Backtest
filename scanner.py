@@ -7,7 +7,7 @@ import requests
 import streamlit as st
 
 st.set_page_config(
-    page_title="Polymarket AI Data Extractor",
+    page_title="Polymarket Backtest Extractor",
     page_icon="🧬",
     layout="centered",
 )
@@ -111,25 +111,18 @@ def parse_tournament(title: str) -> str:
     return "Unknown"
 
 
-def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
-    """
-    Xây dựng 1 bảng sổ cái nguyên tử duy nhất (Single Source of Truth) từ /v2/positions & /v2/activity:
-    - Khớp 100% số lượng market và tổng PnL thực tế sau phí Taker (realized_pnl + unrealized_pnl).
-    - Fix 1: Khôi phục vốn gốc thật khi bán sớm (tránh số dư bụi $0.01 làm ROI nhảy nghìn %).
-    - Fix 2: Giữ toàn bộ kèo SPLIT/MERGE trong sổ cái để không lọt lỗ/lãi, nhưng tách khỏi `is_backtest_clean`.
-    - Fix 3: Kèo hòa vốn sau phí (`total_pnl <= 0`) được tính là `is_win = False`.
-    """
+def build_backtest_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
+    """Trích xuất sổ cái chuẩn từ /v2/positions & /v2/activity làm nguồn dữ liệu phân tích."""
     w = wallet.strip()
     raw_positions = []
-    all_statuses = ("CLOSED", "REDEEMABLE", "REDEEMABLE_LOST", "MERGEABLE", "OPEN")
-    for st_val in all_statuses:
+    for st_val in ("CLOSED", "REDEEMABLE", "REDEEMABLE_LOST", "MERGEABLE", "OPEN"):
         batch = fetch_v2_cursor(POSITIONS_URL, {"user": w, "status": st_val, "limit": 500}, max_pages=120)
         for item in batch:
             item["_queried_status"] = st_val
         raw_positions.extend(batch)
 
     if not raw_positions:
-        return pd.DataFrame(), {}
+        return pd.DataFrame(), {"volume": 0.0, "pnl": 0.0, "markets": 0, "roi_pct": 0.0}
 
     df = pd.DataFrame(raw_positions)
 
@@ -145,7 +138,6 @@ def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     df["title"] = col(df, ["title", "question"], "").astype(str).str.strip()
     df["outcome"] = col(df, ["outcome"], "").astype(str).str.strip()
 
-    # Khử trùng lặp nếu API trả cùng vị thế ở 2 lần truy vấn status
     dedup_key = np.where(
         df["token_id"] != "",
         df["token_id"] + "_" + df["status"],
@@ -159,14 +151,9 @@ def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     df["current_size"] = pd.to_numeric(col(df, ["current_size"]), errors="coerce").fillna(0.0)
     df["current_value"] = pd.to_numeric(col(df, ["current_value"]), errors="coerce").fillna(0.0)
 
-    # Chuẩn Data API v2 (đã khấu trừ phí Taker thực tế): total_pnl = realized_pnl + unrealized_pnl
     realized_s = pd.to_numeric(col(df, ["realized_pnl"]), errors="coerce").fillna(0.0)
     unrealized_raw = pd.to_numeric(col(df, ["unrealized_pnl"]), errors="coerce")
-    implied_unrealized = np.where(
-        df["status"] == "OPEN",
-        df["current_value"] - df["entry_cost_usdc"],
-        0.0,
-    )
+    implied_unrealized = np.where(df["status"] == "OPEN", df["current_value"] - df["entry_cost_usdc"], 0.0)
     unrealized_s = unrealized_raw.fillna(pd.Series(implied_unrealized, index=df.index)).fillna(0.0)
     df["realized_pnl"] = realized_s
     df["unrealized_pnl"] = unrealized_s
@@ -175,12 +162,7 @@ def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     df["pos_last_ts"] = col(df, ["last_event_at", "updated_at", "timestamp"]).apply(to_epoch)
     df["pos_first_ts"] = col(df, ["first_entry_at", "created_at"]).apply(to_epoch)
 
-    # Kéo TOÀN BỘ /v2/activity (TRADE, SPLIT, MERGE, REDEEM, CONVERSION)
     act_rows = fetch_v2_cursor(ACTIVITY_URL, {"user": w, "limit": 500}, max_pages=150)
-
-    total_two_way_vol = 0.0
-    activity_type_counts = {}
-
     if act_rows:
         adf = pd.DataFrame(act_rows)
         adf["act_type"] = col(adf, ["type", "activity_type"], "TRADE").astype(str).str.upper()
@@ -192,9 +174,6 @@ def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
         adf["act_usdc"] = pd.to_numeric(col(adf, ["usdc_size", "amount"]), errors="coerce").fillna(0.0)
         adf["act_usdc"] = np.where(adf["act_usdc"] > 0, adf["act_usdc"], adf["act_price"] * adf["act_size"])
         adf["act_ts"] = col(adf, ["timestamp", "created_at"]).apply(to_epoch)
-
-        activity_type_counts = adf["act_type"].value_counts().to_dict()
-        total_two_way_vol = float(adf["act_usdc"].sum())
 
         trades = adf[adf["act_type"] == "TRADE"].copy()
         valid_trade = trades[trades["act_token"] != ""]
@@ -269,7 +248,6 @@ def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     for c in ("act_buy_usdc", "act_buy_shares", "act_sell_usdc", "split_usdc", "split_shares", "merge_usdc"):
         df[c] = df[c].fillna(0.0)
 
-    # ======================== FIX 1: KHÔI PHỤC VỐN GỐC THẬT KHI BÁN SỚM ========================
     clob_cost = np.maximum(df["entry_cost_usdc"], df["act_buy_usdc"])
     split_side_cost = np.where(df["split_usdc"] > 0, df["split_usdc"] * 0.5, df["split_shares"] * 0.5)
 
@@ -320,7 +298,6 @@ def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     )
     df["avg_price"] = np.where(df["avg_price"] > 0, df["avg_price"], implied_p)
 
-    # Loại bỏ các dòng rác rỗng hoàn toàn (0 vốn, 0 PnL, 0 giao dịch)
     non_dust_mask = (
         (df["status"] == "OPEN")
         | (df["total_pnl"].abs() > 1e-6)
@@ -332,7 +309,6 @@ def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     )
     df = df[non_dust_mask].reset_index(drop=True)
 
-    # Thời gian & thời lượng
     df["first_ts"] = (
         df["first_buy_ts"]
         .fillna(df["first_split_ts"])
@@ -355,7 +331,6 @@ def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     df["last_time_vn"] = dt_last.dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
     df["month"] = dt_first.dt.strftime("%Y-%m").fillna("Unknown")
 
-    # ======================== FIX 2: TÁCH TẦNG SPLIT/MERGE KHỎI BACKTEST GIÁ ========================
     is_open = df["status"] == "OPEN"
     has_split_merge = (df["split_count"] > 0) | (df["merge_count"] > 0) | (df["cost_source"] == "ACTIVITY_SPLIT")
     is_valid_clob_price = (
@@ -370,15 +345,9 @@ def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     df["record_type"] = np.where(
         is_open,
         "OPEN",
-        np.where(
-            has_split_merge,
-            "SETTLED_SPLIT_MERGE",
-            np.where(is_valid_clob_price, "SETTLED_CLOB", "SETTLED_ESTIMATED"),
-        ),
+        np.where(has_split_merge, "SETTLED_SPLIT_MERGE", np.where(is_valid_clob_price, "SETTLED_CLOB", "SETTLED_ESTIMATED")),
     )
     df["is_backtest_clean"] = is_valid_clob_price
-
-    # ======================== FIX 3: KÈO HÒA VỐN SAU PHÍ TÍNH LÀ LỖ (is_win = False) ========================
     df["is_win"] = df["total_pnl"] > 0
 
     df["roi_pct"] = np.where(
@@ -387,12 +356,7 @@ def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
         np.nan,
     ).round(2)
 
-    df["avg_clip_usdc"] = np.where(
-        df["buy_count"] > 0,
-        df["true_cost"] / df["buy_count"],
-        df["true_cost"],
-    ).round(2)
-
+    df["avg_clip_usdc"] = np.where(df["buy_count"] > 0, df["true_cost"] / df["buy_count"], df["true_cost"]).round(2)
     df["exit_style"] = np.where(
         df["merge_count"] > 0,
         "MERGED_2_SIDES",
@@ -410,11 +374,9 @@ def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     cid_outcomes = df[df["condition_id"] != ""].groupby("condition_id")["outcome"].nunique()
     hedged_set = set(cid_outcomes[cid_outcomes >= 2].index)
     df["is_hedged"] = df["condition_id"].isin(hedged_set)
-
     df["market_type"] = df["title"].apply(parse_market_type)
     df["tournament"] = df["title"].apply(parse_tournament)
 
-    # Làm tròn chuẩn số học
     df["avg_price"] = df["avg_price"].round(4)
     df["true_cost"] = df["true_cost"].round(2)
     df["realized_pnl"] = df["realized_pnl"].round(2)
@@ -423,7 +385,7 @@ def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
 
     df = df.sort_values("first_ts", ascending=True, na_position="last").reset_index(drop=True)
 
-    canonical_cols = [
+    cols = [
         "entry_time_vn", "last_time_vn", "month", "status",
         "record_type", "is_backtest_clean", "cost_source",
         "condition_id", "token_id", "title", "outcome",
@@ -432,103 +394,53 @@ def build_canonical_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
         "buy_count", "sell_count", "split_count", "merge_count",
         "avg_clip_usdc", "accum_hours", "hold_hours", "exit_style",
     ]
-    out_df = df[canonical_cols].copy()
+    out_df = df[cols].copy()
 
-    clean_sub = out_df[out_df["is_backtest_clean"]]
-    sm_sub = out_df[out_df["record_type"] == "SETTLED_SPLIT_MERGE"]
-    audit_meta = {
-        "total_rows": len(out_df),
-        "total_unique_markets": int(out_df[out_df["condition_id"] != ""]["condition_id"].nunique()),
-        "clean_rows": len(clean_sub),
-        "clean_pnl": float(clean_sub["total_pnl"].sum()),
-        "sm_rows": len(sm_sub),
-        "sm_markets": int(sm_sub[sm_sub["condition_id"] != ""]["condition_id"].nunique()),
-        "sm_pnl": float(sm_sub["total_pnl"].sum()),
-        "wallet_total_pnl": float(out_df["total_pnl"].sum()),
-        "one_way_cost_all": float(out_df["true_cost"].sum()),
-        "two_way_activity_vol": total_two_way_vol,
-        "activity_type_counts": activity_type_counts,
-        "status_counts": out_df["status"].value_counts().to_dict(),
+    vol_1w = float(out_df["true_cost"].sum())
+    pnl_net = float(out_df["total_pnl"].sum())
+    mkt_cnt = int(out_df[out_df["condition_id"] != ""]["condition_id"].nunique())
+    roi_val = (pnl_net / vol_1w * 100.0) if vol_1w > 0 else 0.0
+
+    summary = {
+        "volume": vol_1w,
+        "pnl": pnl_net,
+        "markets": mkt_cnt,
+        "roi_pct": roi_val,
     }
-    return out_df, audit_meta
+    return out_df, summary
 
 
-# ======================== SINGLE-CSV EXTRACTOR UI ========================
-st.title("🧬 Polymarket AI Data Extractor")
-st.caption("Xuất 1 file CSV chuẩn duy nhất (Single Source of Truth) — Khớp 100% số market & PnL thực tế sau phí.")
+# ======================== MINIMAL 4-METRIC BACKTEST UI ========================
+st.title("🧬 Polymarket Backtest Extractor")
 
-wallet_input = st.text_input("Địa chỉ ví cần trích xuất", value=DEFAULT_WALLET)
+wallet_input = st.text_input("Địa chỉ ví", value=DEFAULT_WALLET)
 
-if st.button("⚡ TRÍCH XUẤT SỔ CÁI CHUẨN (1 FILE CSV)", type="primary", use_container_width=True):
-    with st.spinner("Đang đồng bộ đủ 5 trạng thái /v2/positions & toàn bộ /v2/activity..."):
+if st.button("⚡ TRÍCH XUẤT CSV", type="primary", use_container_width=True):
+    with st.spinner("Đang đồng bộ dữ liệu..."):
         try:
-            ledger_df, audit_meta = build_canonical_ledger(wallet_input)
-            now_vn = datetime.now(VN_TZ).strftime("%Y%m%d_%H%M")
-            st.session_state["canonical_pack"] = (ledger_df, audit_meta, now_vn)
+            ledger_df, summary = build_backtest_ledger(wallet_input)
+            ts_tag = datetime.now(VN_TZ).strftime("%Y%m%d_%H%M")
+            st.session_state["backtest_pack"] = (ledger_df, summary, ts_tag)
         except Exception as e:
-            st.error(f"Lỗi gọi API Polymarket v2: {e}")
+            st.error(f"Lỗi gọi API: {e}")
             st.stop()
 
-if "canonical_pack" in st.session_state:
-    ledger_df, audit_meta, ts_tag = st.session_state["canonical_pack"]
+if "backtest_pack" in st.session_state:
+    ledger_df, summary, ts_tag = st.session_state["backtest_pack"]
     if ledger_df.empty:
-        st.warning("Không có dữ liệu vị thế nào cho ví này.")
+        st.warning("Không có dữ liệu cho ví này.")
     else:
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric(
-            "Tổng Market Quét Được",
-            f"{audit_meta['total_unique_markets']:,}",
-            f"{audit_meta['total_rows']:,} vị thế",
-        )
-        c2.metric(
-            "Vốn Gốc 1 Chiều",
-            f"${audit_meta['one_way_cost_all']:,.0f}",
-            f"Vol 2 chiều: ${audit_meta['two_way_activity_vol']:,.0f}",
-        )
-        c3.metric(
-            "PnL Thực Tế (Sau Phí)",
-            f"${audit_meta['wallet_total_pnl']:+,.2f}",
-            "Khớp tiền mặt thực tế",
-        )
-        c4.metric(
-            "Nhóm Split / Merge",
-            f"${audit_meta['sm_pnl']:+,.2f}",
-            f"{audit_meta['sm_markets']} markets ({audit_meta['sm_rows']} dòng)",
-        )
-
-        # Bảng tóm tắt cấu trúc 4 tầng bên trong file CSV duy nhất
-        grp_summary = (
-            ledger_df.groupby(["record_type", "is_backtest_clean"], as_index=False)
-            .agg(
-                so_dong=("total_pnl", "count"),
-                so_market=("condition_id", "nunique"),
-                thang=("is_win", "sum"),
-                von_goc=("true_cost", "sum"),
-                pnl_rong=("total_pnl", "sum"),
-            )
-            .rename(
-                columns={
-                    "record_type": "Phân nhóm (record_type)",
-                    "is_backtest_clean": "Dùng Backtest Giá",
-                    "so_dong": "Số dòng",
-                    "so_market": "Số Market",
-                    "thang": "Số Win (>0$)",
-                    "von_goc": "Vốn gốc ($)",
-                    "pnl_rong": "PnL ròng ($)",
-                }
-            )
-        )
-        grp_summary["Vốn gốc ($)"] = grp_summary["Vốn gốc ($)"].round(2)
-        grp_summary["PnL ròng ($)"] = grp_summary["PnL ròng ($)"].round(2)
-        st.dataframe(grp_summary, use_container_width=True, hide_index=True)
+        c1.metric("Volume (Mua 1 chiều)", f"${summary['volume']:,.0f}")
+        c2.metric("PNL", f"${summary['pnl']:+,.2f}")
+        c3.metric("Market", f"{summary['markets']:,}")
+        c4.metric("ROI", f"{summary['roi_pct']:+.3f}%")
 
         st.download_button(
-            label=f"📥 TẢI FILE CSV CHUẨN DUY NHẤT (polymarket_ledger_{ts_tag}.csv)",
+            label=f"📥 TẢI FILE CSV (polymarket_backtest_{ts_tag}.csv)",
             data=ledger_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"polymarket_ledger_{ts_tag}.csv",
+            file_name=f"polymarket_backtest_{ts_tag}.csv",
             mime="text/csv",
             type="primary",
             use_container_width=True,
         )
-
-        st.dataframe(ledger_df.tail(15), use_container_width=True, hide_index=True)
