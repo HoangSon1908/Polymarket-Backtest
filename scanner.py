@@ -8,6 +8,7 @@ import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 import streamlit as st
+from urllib3.util.retry import Retry
 
 st.set_page_config(
     page_title="Polymarket Backtest Extractor",
@@ -26,14 +27,20 @@ _THREAD_LOCAL = threading.local()
 
 
 def get_http_session() -> requests.Session:
-    """Mỗi thread tái sử dụng 1 HTTP Keep-Alive Session để giảm độ trễ TLS handshake."""
+    """Mỗi thread tái sử dụng 1 HTTP Keep-Alive Session kèm Retry tự động khi gặp 429/5xx."""
     sess = getattr(_THREAD_LOCAL, "session", None)
     if sess is None:
         sess = requests.Session()
-        adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16)
+        retry_cfg = Retry(
+            total=4,
+            backoff_factor=0.8,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )
+        adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=retry_cfg)
         sess.mount("https://", adapter)
         sess.mount("http://", adapter)
-        sess.headers.update({"Accept": "application/json", "User-Agent": "Polymarket-Backtest-Extractor/2.0"})
+        sess.headers.update({"Accept": "application/json", "User-Agent": "Polymarket-Backtest-Extractor/2.1"})
         _THREAD_LOCAL.session = sess
     return sess
 
@@ -332,11 +339,18 @@ def _collapse_split_merge_group(g: pd.DataFrame) -> pd.Series:
     return row
 
 
-def build_ai_slim_csv(df: pd.DataFrame, clean_only: bool = True, recent_months: int = 0) -> pd.DataFrame:
+def build_ai_slim_csv(
+    df: pd.DataFrame,
+    clean_only: bool = True,
+    recent_months: int = 0,
+    min_whale_cost: float = 0.0,
+) -> pd.DataFrame:
     """
-    Tạo phiên bản CSV tối ưu cho AI (giảm ~45%-65% token):
-    - Xóa token_id (chuỗi 77 ký tự) & rút gọn condition_id còn 10 ký tự để giữ khả năng phát hiện Hedge.
-    - Loại bỏ các cột cờ hằng số/trùng lặp nhưng giữ nguyên 100% độ chính xác thống kê.
+    Nén tối đa file CSV cho Gemini (~10-13 tokens/dòng, giảm ~60% so với bản cũ):
+    - Cắt bỏ giây (:SS), xóa month & last_time_vn trùng lặp.
+    - Thay chuỗi hex condition_id bằng mã nhóm ngắn H1, H2... chỉ trên kèo có Hedge 2 đầu.
+    - Xóa hậu tố giải đấu đã tách ở cột tournament & tiền tố boilerplate trong title.
+    - Xóa cột tính toán suy diễn (roi_pct, avg_clip_usdc) nhưng giữ đủ 100% biến gốc để chạy mọi phép kiểm định.
     """
     sub = df.copy()
     if clean_only and "is_backtest_clean" in sub.columns:
@@ -344,18 +358,135 @@ def build_ai_slim_csv(df: pd.DataFrame, clean_only: bool = True, recent_months: 
     if recent_months > 0 and "month" in sub.columns:
         valid_months = sorted([m for m in sub["month"].unique() if m != "Unknown"])
         if len(valid_months) > recent_months:
-            keep_m = set(valid_months[-recent_months:])
-            sub = sub[sub["month"].isin(keep_m)].copy()
+            sub = sub[sub["month"].isin(set(valid_months[-recent_months:]))].copy()
+    if min_whale_cost > 0 and "true_cost" in sub.columns:
+        sub = sub[sub["true_cost"] >= min_whale_cost].copy()
 
-    if "condition_id" in sub.columns:
-        sub["condition_id"] = sub["condition_id"].astype(str).str[:10]
+    if sub.empty:
+        return pd.DataFrame()
 
-    drop_cols = [
-        "token_id", "is_backtest_clean", "is_clob_only", "cost_source",
-        "realized_pnl", "unrealized_pnl", "sell_count", "split_count", "merge_count", "exit_style",
+    sub["entry_time_vn"] = sub["entry_time_vn"].astype(str).str.slice(0, 16)
+
+    hedged_mask = sub["is_hedged"].fillna(False).astype(bool)
+    hedged_cids = sub.loc[hedged_mask, "condition_id"].unique()
+    cid_map = {cid: f"H{i+1}" for i, cid in enumerate(hedged_cids)}
+    sub["hedge_id"] = np.where(hedged_mask, sub["condition_id"].map(cid_map).fillna(""), "")
+
+    def _compact_title(row) -> str:
+        t = str(row["title"] or "")
+        if row.get("tournament") not in ("", "Unknown", "Side_Market") and " - " in t:
+            t = t.split(" - ", 1)[0].strip()
+        return re.sub(
+            r"^(Counter-Strike:\s*|Dota 2:\s*|League of Legends:\s*|Valorant:\s*|Will the highest temperature in\s*)",
+            "",
+            t,
+            flags=re.IGNORECASE,
+        )
+
+    sub["title"] = sub.apply(_compact_title, axis=1)
+    sub["is_win"] = np.where(sub["is_win"].fillna(False), "1", "")
+    sub["record_type"] = sub["record_type"].replace({
+        "SETTLED_CLOB": "CLOB",
+        "SETTLED_SPLIT_MERGE": "SM",
+        "SETTLED_ESTIMATED": "EST",
+    })
+    sub["avg_price"] = sub["avg_price"].round(3)
+
+    keep_cols = [
+        "entry_time_vn", "record_type", "hedge_id", "title", "outcome",
+        "market_type", "tournament", "avg_price", "true_cost", "total_pnl",
+        "is_win", "buy_count", "accum_hours", "hold_hours",
     ]
-    keep_cols = [c for c in sub.columns if c not in drop_cols]
-    return sub[keep_cols].reset_index(drop=True)
+    return sub[[c for c in keep_cols if c in sub.columns]].reset_index(drop=True)
+
+
+def build_ai_prompt_digest(df: pd.DataFrame, wallet: str, label: str) -> str:
+    """
+    Tạo bản tóm tắt kiểm toán định lượng (~500-600 tokens) gồm:
+    - Thống kê tổng hợp, Z-score trọng số vốn & PnL_exTop5 (chống lệ thuộc kèo độc đắc).
+    - Kiểm định phân tách thời gian Out-of-Sample (70% đầu vs 30% gần nhất) chống overfit.
+    - Phân phối theo Tháng, Dải giá, Quy mô vốn ví gốc, Market Type & Top Giải đấu.
+    """
+    clean = df[df["is_backtest_clean"]].copy() if "is_backtest_clean" in df.columns else df.copy()
+    if clean.empty:
+        return f"AUDIT SUMMARY | {label} ({wallet}): Không có dữ liệu kèo đã tất toán."
+
+    def _calc_z(sub: pd.DataFrame) -> float:
+        p = sub["avg_price"].clip(0.02, 0.98)
+        c = sub["true_cost"].clip(lower=0.0)
+        var_sum = float(((c ** 2) * (1.0 - p) / p).sum())
+        return float(sub["total_pnl"].sum()) / np.sqrt(var_sum) if var_sum > 0 else 0.0
+
+    def _agg_table(sub: pd.DataFrame, group_col: str, top_n: int = 8) -> str:
+        g = (
+            sub.groupby(group_col, dropna=False, observed=False)
+            .agg(
+                n=("total_pnl", "count"),
+                wr=("is_win", "mean"),
+                avg_p=("avg_price", "mean"),
+                vol=("true_cost", "sum"),
+                pnl=("total_pnl", "sum"),
+            )
+            .sort_values("vol", ascending=False)
+            .head(top_n)
+        )
+        lines = [
+            f"  - {idx}: N={int(r.n)}, WR={r.wr*100:.1f}%, AvgP={r.avg_p*100:.1f}c, "
+            f"Vol=${r.vol:,.0f}, PnL=${r.pnl:+,.1f} (ROI {r.pnl/max(r.vol,1)*100:+.1f}%)"
+            for idx, r in g.iterrows()
+            if r.n > 0
+        ]
+        return "\n".join(lines) if lines else "  - N/A"
+
+    clean["price_band"] = pd.cut(
+        clean["avg_price"],
+        bins=[-0.01, 0.35, 0.50, 0.60, 0.85, 1.01],
+        labels=["<35c", "35-50c", "50-60c", "60-85c", ">85c"],
+    )
+    clean["size_band"] = pd.cut(
+        clean["true_cost"],
+        bins=[-1, 400, 2000, 10000, 20000, 1e9],
+        labels=["<400", "400-2k", "2k-10k", "10k-20k", ">20k"],
+    )
+
+    tot_vol = float(clean["true_cost"].sum())
+    tot_pnl = float(clean["total_pnl"].sum())
+    z_all = _calc_z(clean)
+    top5_pnl = float(clean.nlargest(5, "total_pnl")["total_pnl"].sum())
+    ex_top5 = tot_pnl - top5_pnl
+    med_accum = float(clean["accum_hours"].median())
+    med_hold = float(clean["hold_hours"].median())
+    hedge_share = float(clean.loc[clean["is_hedged"], "true_cost"].sum()) / max(tot_vol, 1.0) * 100.0
+
+    # Phân tách thời gian Out-of-Sample (70% đầu vs 30% gần nhất)
+    split_idx = int(len(clean) * 0.7)
+    if split_idx >= 5 and (len(clean) - split_idx) >= 5:
+        is_df = clean.iloc[:split_idx]
+        oos_df = clean.iloc[split_idx:]
+        oos_line = (
+            f"[Kiểm định Thời gian 70/30 OOS]\n"
+            f"  - In-Sample (70% đầu, N={len(is_df)}): WR={is_df['is_win'].mean()*100:.1f}%, "
+            f"Vol=${is_df['true_cost'].sum():,.0f}, PnL=${is_df['total_pnl'].sum():+,.1f} "
+            f"(ROI {is_df['total_pnl'].sum()/max(is_df['true_cost'].sum(),1)*100:+.1f}%, Z={_calc_z(is_df):.2f})\n"
+            f"  - Out-of-Sample (30% gần nhất, N={len(oos_df)}): WR={oos_df['is_win'].mean()*100:.1f}%, "
+            f"Vol=${oos_df['true_cost'].sum():,.0f}, PnL=${oos_df['total_pnl'].sum():+,.1f} "
+            f"(ROI {oos_df['total_pnl'].sum()/max(oos_df['true_cost'].sum(),1)*100:+.1f}%, Z={_calc_z(oos_df):.2f})\n"
+        )
+    else:
+        oos_line = ""
+
+    return (
+        f"AUDIT SUMMARY | {label} ({wallet})\n"
+        f"Clean: N={len(clean)}, WR={clean['is_win'].mean()*100:.1f}%, AvgP={clean['avg_price'].mean()*100:.1f}c, "
+        f"Vol=${tot_vol:,.0f}, PnL=${tot_pnl:+,.2f} (ROI {tot_pnl/max(tot_vol,1)*100:+.2f}%), Z={z_all:.2f}\n"
+        f"Risk: PnL_exTop5=${ex_top5:+,.2f}, HedgeVol={hedge_share:.1f}%, MedAccum={med_accum:.1f}h, MedHold={med_hold:.1f}h\n"
+        f"{oos_line}"
+        f"[Theo Tháng]\n{_agg_table(clean, 'month', 6)}\n"
+        f"[Theo Dải Giá]\n{_agg_table(clean, 'price_band', 5)}\n"
+        f"[Theo Quy Mô Vốn Ví Gốc]\n{_agg_table(clean, 'size_band', 5)}\n"
+        f"[Theo Market Type]\n{_agg_table(clean, 'market_type', 8)}\n"
+        f"[Top Giải Đấu]\n{_agg_table(clean, 'tournament', 8)}"
+    )
 
 
 def build_backtest_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
@@ -725,13 +856,14 @@ col_w, col_n = st.columns([2.2, 1.3])
 wallet_input = col_w.text_input("Địa chỉ ví (0x...) hoặc @username", value=DEFAULT_WALLET)
 custom_name_input = col_n.text_input("Tên file gợi nhớ (tùy chọn)", placeholder="Bỏ trống = tự lấy tên profile")
 
-opt_c1, opt_c2 = st.columns(2)
-ai_clean_only = opt_c1.checkbox("Bản AI: Chỉ xuất kèo đã tất toán (Clean)", value=True)
+opt_c1, opt_c2, opt_c3 = st.columns([1.2, 1.0, 1.0])
+ai_clean_only = opt_c1.checkbox("Bản AI: Chỉ kèo đã tất toán", value=True)
 ai_months_opt = opt_c2.selectbox(
-    "Phạm vi tháng cho bản AI",
-    options=[0, 2, 3],
+    "Phạm vi tháng (AI)",
+    options=[2, 1, 3, 0],
     format_func=lambda m: "Toàn bộ lịch sử" if m == 0 else f"{m} tháng gần nhất",
 )
+ai_min_cost = opt_c3.number_input("Min vốn ví gốc ($)", min_value=0, value=0, step=100)
 
 if st.button("⚡ TRÍCH XUẤT CSV", type="primary", use_container_width=True):
     with st.spinner("Đang đồng bộ đa luồng & kiểm toán dữ liệu..."):
@@ -777,15 +909,21 @@ if "backtest_pack" in st.session_state:
         st.warning(f"Không có dữ liệu cho ví `{resolved_wallet}`.")
     else:
         final_label = sanitize_filename_part(custom_name_input) or auto_name
-        ai_df = build_ai_slim_csv(ledger_df, clean_only=ai_clean_only, recent_months=ai_months_opt)
+        ai_df = build_ai_slim_csv(
+            ledger_df,
+            clean_only=ai_clean_only,
+            recent_months=ai_months_opt,
+            min_whale_cost=float(ai_min_cost),
+        )
 
         raw_bytes = ledger_df.to_csv(index=False).encode("utf-8-sig")
         ai_bytes = ai_df.to_csv(index=False).encode("utf-8-sig")
         saved_pct = (1.0 - len(ai_bytes) / max(len(raw_bytes), 1)) * 100.0
+        est_ai_tokens = int(len(ai_bytes) / 3.2)
 
         st.caption(
             f"Ví: `{resolved_wallet}` • Profile: **{auto_name}** • "
-            f"Bản AI gọn hơn **{saved_pct:.0f}%** ({len(ai_df):,}/{len(ledger_df):,} dòng)"
+            f"Bản AI gọn hơn **{saved_pct:.0f}%** ({len(ai_df):,}/{len(ledger_df):,} dòng • ~**{est_ai_tokens:,} tokens**)"
         )
 
         c1, c2, c3, c4 = st.columns(4)
@@ -804,12 +942,13 @@ if "backtest_pack" in st.session_state:
 
         dl1, dl2 = st.columns(2)
         dl1.download_button(
-            label=f"⚡ TẢI CSV GỌN CHO AI ({final_label}_ai.csv)",
+            label=f"⚡ TẢI CSV SIÊU GỌN CHO AI ({final_label}_ai.csv)",
             data=ai_bytes,
             file_name=f"{final_label}_ai.csv",
             mime="text/csv",
             type="primary",
             use_container_width=True,
+            disabled=ai_df.empty,
         )
         dl2.download_button(
             label=f"📦 TẢI CSV GỐC ĐẦY ĐỦ ({final_label}.csv)",
@@ -818,3 +957,7 @@ if "backtest_pack" in st.session_state:
             mime="text/csv",
             use_container_width=True,
         )
+
+        with st.expander("📋 Copy tóm tắt ~550 tokens (Dán hỏi Gemini nhanh không cần tải CSV)", expanded=True):
+            digest_txt = build_ai_prompt_digest(ledger_df, resolved_wallet, final_label)
+            st.code(digest_txt, language="text")
