@@ -1,9 +1,12 @@
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
 import streamlit as st
 
 st.set_page_config(
@@ -19,6 +22,20 @@ ACTIVITY_URL = f"{BASE_V2_URL}/activity"
 DEFAULT_WALLET = "0x474D6503CD4867D611b012ED6c8a6fAAaf5e6b5f"
 VN_TZ = timezone(timedelta(hours=7))
 EVM_ADDR_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+_THREAD_LOCAL = threading.local()
+
+
+def get_http_session() -> requests.Session:
+    """Mỗi thread tái sử dụng 1 HTTP Keep-Alive Session để giảm độ trễ TLS handshake."""
+    sess = getattr(_THREAD_LOCAL, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16)
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
+        sess.headers.update({"Accept": "application/json", "User-Agent": "Polymarket-Backtest-Extractor/2.0"})
+        _THREAD_LOCAL.session = sess
+    return sess
 
 
 def sanitize_filename_part(name: str) -> str:
@@ -32,55 +49,41 @@ def _is_valid_profile_name(val: str) -> bool:
     s = str(val or "").strip()
     if not s:
         return False
-    # Bỏ qua chuỗi là địa chỉ ví 0x... hoặc mã rút gọn 0x1234...abcd
     if s.lower().startswith("0x") and (len(s) >= 10 or "..." in s):
         return False
     return True
 
 
 def lookup_profile_name_by_wallet(wallet: str) -> str:
-    """Tra cứu username/profile name trên Polymarket từ địa chỉ ví 0x... qua nhiều nguồn."""
+    """Tra cứu nhanh username/profile name trên Polymarket (chỉ gọi khi payload chưa có tên)."""
     w = wallet.strip()
     w_lower = w.lower()
-    headers = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+    sess = get_http_session()
 
-    # Lớp 1: Gamma /public-profile?address=0x...
-    for addr_variant in (w, w_lower):
-        try:
-            resp = requests.get(
-                f"{GAMMA_API_BASE}/public-profile",
-                params={"address": addr_variant},
-                headers=headers,
-                timeout=8,
-            )
-            if resp.ok:
-                data = resp.json()
-                if isinstance(data, dict):
-                    for key in ("name", "pseudonym", "userName", "user_name", "username"):
-                        cand = str(data.get(key) or "").strip()
-                        if _is_valid_profile_name(cand):
-                            return cand
-        except Exception:
-            pass
-
-    # Lớp 2: Data API v2 /leaderboard (snake_case & camelCase, xác minh khớp đúng proxy_wallet)
+    # Lớp 1: Gamma /public-profile
     try:
-        resp = requests.get(
+        resp = sess.get(f"{GAMMA_API_BASE}/public-profile", params={"address": w_lower}, timeout=5)
+        if resp.ok and isinstance(resp.json(), dict):
+            data = resp.json()
+            for key in ("name", "pseudonym", "userName", "user_name", "username"):
+                cand = str(data.get(key) or "").strip()
+                if _is_valid_profile_name(cand):
+                    return cand
+    except Exception:
+        pass
+
+    # Lớp 2: Data API v2 /leaderboard
+    try:
+        resp = sess.get(
             f"{BASE_V2_URL}/leaderboard",
             params={"category": "OVERALL", "timePeriod": "ALL", "user": w_lower, "limit": 5},
-            headers=headers,
-            timeout=8,
+            timeout=5,
         )
         if resp.ok:
             payload = resp.json()
             rows = payload.get("data") or [] if isinstance(payload, dict) else (payload or [])
             for item in rows:
-                pw = str(
-                    item.get("proxy_wallet")
-                    or item.get("proxyWallet")
-                    or item.get("user")
-                    or ""
-                ).strip().lower()
+                pw = str(item.get("proxy_wallet") or item.get("proxyWallet") or item.get("user") or "").strip().lower()
                 if pw == w_lower:
                     for key in ("user_name", "userName", "name", "pseudonym"):
                         cand = str(item.get(key) or "").strip()
@@ -91,11 +94,10 @@ def lookup_profile_name_by_wallet(wallet: str) -> str:
 
     # Lớp 3: Gamma /public-search
     try:
-        resp = requests.get(
+        resp = sess.get(
             f"{GAMMA_API_BASE}/public-search",
-            params={"q": w_lower, "search_profiles": "true", "limit_per_type": 10},
-            headers=headers,
-            timeout=8,
+            params={"q": w_lower, "search_profiles": "true", "limit_per_type": 5},
+            timeout=5,
         )
         if resp.ok:
             profiles = (resp.json() or {}).get("profiles") or []
@@ -109,36 +111,13 @@ def lookup_profile_name_by_wallet(wallet: str) -> str:
     except Exception:
         pass
 
-    # Lớp 4: Đọc metadata trực tiếp từ trang profile công khai polymarket.com/profile/0x...
-    try:
-        page = requests.get(
-            f"https://polymarket.com/profile/{w}",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10,
-        )
-        if page.ok:
-            html = page.text
-            # Tìm trong JSON nhúng của trang profile
-            for pat in (
-                r'"name"\s*:\s*"([^"]+)"',
-                r'"pseudonym"\s*:\s*"([^"]+)"',
-                r"<title>([^<|]+?)(?:\s*\(@[^)]+\))?\s*\|\s*Polymarket</title>",
-            ):
-                m = re.search(pat, html)
-                if m:
-                    cand = m.group(1).strip()
-                    if _is_valid_profile_name(cand) and cand.lower() not in ("polymarket", "profile"):
-                        return cand
-    except Exception:
-        pass
-
     return ""
 
 
-def resolve_wallet_and_name(raw_input: str) -> tuple[str, str, str]:
+def resolve_wallet_only(raw_input: str) -> tuple[str, str, str]:
     """
-    Chấp nhận cả địa chỉ 0x... lẫn @username.
-    Trả về: (wallet_address, profile_name_for_file, error_message)
+    Phân giải địa chỉ ví 0x... tức thì (không tốn HTTP call nếu đã nhập 0x...).
+    Trả về: (wallet_address, preset_profile_name, error_message)
     """
     cleaned = raw_input.strip()
     if not cleaned:
@@ -148,28 +127,21 @@ def resolve_wallet_and_name(raw_input: str) -> tuple[str, str, str]:
     cache_key = cleaned.lower()
     if cache_key in cache:
         w_cached, n_cached = cache[cache_key]
-        # Nếu trước đó cache tạm mã rút gọn (0x1234_abcd), thử tra lại profile name 1 lần nữa
-        if not re.match(r"^0x[a-fA-F0-9]{4}_[a-fA-F0-9]{4}$", n_cached):
-            return w_cached, n_cached, ""
+        return w_cached, n_cached, ""
 
-    # Trường hợp 1: Dán trực tiếp địa chỉ ví 0x...
     if EVM_ADDR_RE.match(cleaned):
-        wallet = cleaned
-        found_name = lookup_profile_name_by_wallet(wallet)
-        auto_name = sanitize_filename_part(found_name) or f"{wallet[:6]}_{wallet[-4:]}"
-        cache[cache_key] = (wallet, auto_name)
-        return wallet, auto_name, ""
+        return cleaned, "", ""
 
-    # Trường hợp 2: Nhập @username -> phân giải ngược ra địa chỉ ví 0x...
     handle = cleaned.lstrip("@").strip()
     resolved_wallet = ""
     found_name = handle
+    sess = get_http_session()
 
     try:
-        resp = requests.get(
+        resp = sess.get(
             f"{GAMMA_API_BASE}/public-search",
             params={"q": handle, "search_profiles": "true", "limit_per_type": 10},
-            timeout=10,
+            timeout=8,
         )
         if resp.ok:
             profiles = (resp.json() or {}).get("profiles") or []
@@ -193,31 +165,7 @@ def resolve_wallet_and_name(raw_input: str) -> tuple[str, str, str]:
 
     if not resolved_wallet:
         try:
-            resp = requests.get(
-                f"{BASE_V2_URL}/leaderboard",
-                params={"category": "OVERALL", "timePeriod": "ALL", "userName": handle, "limit": 10},
-                timeout=10,
-            )
-            if resp.ok:
-                payload = resp.json()
-                rows = payload.get("data") or [] if isinstance(payload, dict) else (payload or [])
-                for item in rows:
-                    pw = str(item.get("proxy_wallet") or item.get("proxyWallet") or item.get("user") or "").strip()
-                    if EVM_ADDR_RE.match(pw):
-                        resolved_wallet = pw
-                        cand = str(item.get("user_name") or item.get("userName") or "").strip()
-                        found_name = cand if _is_valid_profile_name(cand) else handle
-                        break
-        except Exception:
-            pass
-
-    if not resolved_wallet:
-        try:
-            page = requests.get(
-                f"https://polymarket.com/@{handle}",
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=10,
-            )
+            page = sess.get(f"https://polymarket.com/@{handle}", timeout=8)
             if page.ok:
                 m_json = re.search(r'"proxyWallet"\s*:\s*"(0x[a-fA-F0-9]{40})"', page.text)
                 if m_json:
@@ -234,16 +182,18 @@ def resolve_wallet_and_name(raw_input: str) -> tuple[str, str, str]:
 
 
 def fetch_v2_cursor(endpoint: str, base_params: dict, max_pages: int = 150) -> list[dict]:
-    """Kéo toàn bộ dữ liệu theo chuẩn Polymarket Data API v2 (Cursor-only, không dùng offset)."""
+    """Kéo toàn bộ dữ liệu theo chuẩn Polymarket Data API v2 (Cursor-only + chống lặp cursor)."""
     rows = []
     params = dict(base_params)
     params["limit"] = min(int(params.get("limit", 500)), 500)
     anchor_keys = [k for k in ("user", "status", "type", "side") if k in params]
+    seen_cursors: set[str] = set()
+    sess = get_http_session()
 
     for _ in range(max_pages):
-        res = requests.get(endpoint, params=params, timeout=20)
+        res = sess.get(endpoint, params=params, timeout=20)
         if res.status_code == 429:
-            time.sleep(2.0)
+            time.sleep(1.5)
             continue
         res.raise_for_status()
         payload = res.json()
@@ -259,9 +209,10 @@ def fetch_v2_cursor(endpoint: str, base_params: dict, max_pages: int = 150) -> l
         next_cursor = pagination.get("next_cursor")
         has_more = pagination.get("has_more", False)
 
-        if not next_cursor or not has_more:
+        if not next_cursor or not has_more or next_cursor in seen_cursors:
             break
 
+        seen_cursors.add(next_cursor)
         params = {k: base_params[k] for k in anchor_keys}
         params["cursor"] = next_cursor
 
@@ -326,10 +277,7 @@ def parse_tournament(title: str) -> str:
 
 
 def _collapse_split_merge_group(g: pd.DataFrame) -> pd.Series:
-    """
-    Cách C: Gộp 2 chân (Yes + No) của cùng 1 market SETTLED_SPLIT_MERGE thành 1 vị thế theo condition_id.
-    Giữ nguyên tổng Volume, tổng PNL thực tế, đồng thời khôi phục đúng số lượng lệnh cho Winrate.
-    """
+    """Gộp 2 chân (Yes + No) của cùng 1 market SETTLED_SPLIT_MERGE thành 1 vị thế theo condition_id."""
     g_sorted = g.sort_values("true_cost", ascending=False)
     first = g_sorted.iloc[0]
 
@@ -384,34 +332,63 @@ def _collapse_split_merge_group(g: pd.DataFrame) -> pd.Series:
     return row
 
 
+def build_ai_slim_csv(df: pd.DataFrame, clean_only: bool = True, recent_months: int = 0) -> pd.DataFrame:
+    """
+    Tạo phiên bản CSV tối ưu cho AI (giảm ~45%-65% token):
+    - Xóa token_id (chuỗi 77 ký tự) & rút gọn condition_id còn 10 ký tự để giữ khả năng phát hiện Hedge.
+    - Loại bỏ các cột cờ hằng số/trùng lặp nhưng giữ nguyên 100% độ chính xác thống kê.
+    """
+    sub = df.copy()
+    if clean_only and "is_backtest_clean" in sub.columns:
+        sub = sub[sub["is_backtest_clean"]].copy()
+    if recent_months > 0 and "month" in sub.columns:
+        valid_months = sorted([m for m in sub["month"].unique() if m != "Unknown"])
+        if len(valid_months) > recent_months:
+            keep_m = set(valid_months[-recent_months:])
+            sub = sub[sub["month"].isin(keep_m)].copy()
+
+    if "condition_id" in sub.columns:
+        sub["condition_id"] = sub["condition_id"].astype(str).str[:10]
+
+    drop_cols = [
+        "token_id", "is_backtest_clean", "is_clob_only", "cost_source",
+        "realized_pnl", "unrealized_pnl", "sell_count", "split_count", "merge_count", "exit_style",
+    ]
+    keep_cols = [c for c in sub.columns if c not in drop_cols]
+    return sub[keep_cols].reset_index(drop=True)
+
+
 def build_backtest_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
-    """Trích xuất sổ cái chuẩn theo Cách C từ /v2/positions & /v2/activity."""
+    """Trích xuất sổ cái chuẩn theo Cách C từ /v2/positions & /v2/activity (song song đa luồng)."""
     w = wallet.strip()
-    raw_positions = []
-    for st_val in ("CLOSED", "REDEEMABLE", "REDEEMABLE_LOST", "MERGEABLE", "OPEN"):
+    statuses = ("CLOSED", "REDEEMABLE", "REDEEMABLE_LOST", "MERGEABLE", "OPEN")
+
+    def _pull_pos(st_val: str) -> list[dict]:
         batch = fetch_v2_cursor(POSITIONS_URL, {"user": w, "status": st_val, "limit": 500}, max_pages=120)
         for item in batch:
             item["_queried_status"] = st_val
-        raw_positions.extend(batch)
+        return batch
+
+    # Chạy song song 5 luồng status + 1 luồng activity cùng lúc (~3x-4x nhanh hơn)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        pos_futures = [pool.submit(_pull_pos, st_val) for st_val in statuses]
+        act_future = pool.submit(fetch_v2_cursor, ACTIVITY_URL, {"user": w, "limit": 500}, 150)
+
+        raw_positions = []
+        for fut in pos_futures:
+            raw_positions.extend(fut.result())
+        act_rows = act_future.result()
 
     if not raw_positions:
         return pd.DataFrame(), {
-            "volume": 0.0,
-            "pnl": 0.0,
-            "markets": 0,
-            "roi_pct": 0.0,
-            "clean_volume": 0.0,
-            "clean_pnl": 0.0,
-            "clean_markets": 0,
-            "clean_roi_pct": 0.0,
-            "clean_winrate": 0.0,
-            "clean_trades": 0,
+            "volume": 0.0, "pnl": 0.0, "markets": 0, "roi_pct": 0.0,
+            "clean_volume": 0.0, "clean_pnl": 0.0, "clean_markets": 0,
+            "clean_roi_pct": 0.0, "clean_winrate": 0.0, "clean_trades": 0,
             "detected_profile_name": "",
         }
 
-    # Lớp 5 dự phòng tên profile trực tiếp từ payload API
     detected_profile_name = ""
-    for item in raw_positions:
+    for item in raw_positions[:20]:
         for k in ("name", "pseudonym", "user_name", "userName"):
             cand = str(item.get(k) or "").strip()
             if _is_valid_profile_name(cand):
@@ -458,7 +435,6 @@ def build_backtest_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     df["pos_last_ts"] = col(df, ["last_event_at", "updated_at", "timestamp"]).apply(to_epoch)
     df["pos_first_ts"] = col(df, ["first_entry_at", "created_at"]).apply(to_epoch)
 
-    act_rows = fetch_v2_cursor(ACTIVITY_URL, {"user": w, "limit": 500}, max_pages=150)
     if act_rows:
         if not detected_profile_name:
             for item in act_rows[:30]:
@@ -653,8 +629,11 @@ def build_backtest_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
         "OPEN",
         np.where(has_split_merge, "SETTLED_SPLIT_MERGE", np.where(is_valid_clob_price, "SETTLED_CLOB", "SETTLED_ESTIMATED")),
     )
-    df["is_clob_only"] = is_valid_clob_price
-    df["is_win"] = df["total_pnl"] > 0
+    df["is_win"] = np.where(
+        df["status"] == "REDEEMABLE",
+        True,
+        np.where(df["status"] == "REDEEMABLE_LOST", False, df["total_pnl"] > 0),
+    )
 
     df["roi_pct"] = np.where(
         (df["true_cost"] > 0.05) & (df["cost_source"] != "UNAVAILABLE"),
@@ -689,7 +668,7 @@ def build_backtest_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     df["unrealized_pnl"] = df["unrealized_pnl"].round(2)
     df["total_pnl"] = df["total_pnl"].round(2)
 
-    # ======================== ÁP DỤNG CÁCH C: GỘP 2 CHÂN SPLIT/MERGE THEO MARKET ========================
+    # Gộp 2 chân SPLIT/MERGE theo condition_id (Cách C)
     sm_mask = (df["record_type"] == "SETTLED_SPLIT_MERGE") & (df["condition_id"] != "")
     sm_df = df[sm_mask].copy()
     other_df = df[~sm_mask].copy()
@@ -699,15 +678,12 @@ def build_backtest_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
             _collapse_split_merge_group(grp)
             for _, grp in sm_df.groupby("condition_id", sort=False)
         ]
-        sm_collapsed_df = pd.DataFrame(collapsed_rows)
-        df = pd.concat([other_df, sm_collapsed_df], ignore_index=True)
+        df = pd.concat([other_df, pd.DataFrame(collapsed_rows)], ignore_index=True)
     else:
         df = other_df.reset_index(drop=True)
 
-    # Cờ chuẩn Cách C: Bỏ OPEN và SETTLED_ESTIMATED, giữ toàn bộ SETTLED_CLOB + SETTLED_SPLIT_MERGE đã gộp
     df["is_backtest_clean"] = ~df["record_type"].isin(["OPEN", "SETTLED_ESTIMATED"])
     df["is_clob_only"] = df["record_type"] == "SETTLED_CLOB"
-
     df = df.sort_values("first_ts", ascending=True, na_position="last").reset_index(drop=True)
 
     cols = [
@@ -721,13 +697,11 @@ def build_backtest_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     ]
     out_df = df[cols].copy()
 
-    # Thống kê toàn bộ ví (All Ledger)
     vol_1w = float(out_df["true_cost"].sum())
     pnl_net = float(out_df["total_pnl"].sum())
     mkt_cnt = int(out_df[out_df["condition_id"] != ""]["condition_id"].nunique())
     roi_val = (pnl_net / vol_1w * 100.0) if vol_1w > 0 else 0.0
 
-    # Thống kê tập chuẩn Backtest Cách C (is_backtest_clean == True)
     clean_sub = out_df[out_df["is_backtest_clean"]]
     clean_vol = float(clean_sub["true_cost"].sum())
     clean_pnl = float(clean_sub["total_pnl"].sum())
@@ -736,45 +710,47 @@ def build_backtest_ledger(wallet: str) -> tuple[pd.DataFrame, dict]:
     clean_wr = float(clean_sub["is_win"].mean() * 100.0) if not clean_sub.empty else 0.0
 
     summary = {
-        "volume": vol_1w,
-        "pnl": pnl_net,
-        "markets": mkt_cnt,
-        "roi_pct": roi_val,
-        "clean_volume": clean_vol,
-        "clean_pnl": clean_pnl,
-        "clean_markets": clean_mkts,
-        "clean_roi_pct": clean_roi,
-        "clean_winrate": clean_wr,
-        "clean_trades": int(len(clean_sub)),
+        "volume": vol_1w, "pnl": pnl_net, "markets": mkt_cnt, "roi_pct": roi_val,
+        "clean_volume": clean_vol, "clean_pnl": clean_pnl, "clean_markets": clean_mkts,
+        "clean_roi_pct": clean_roi, "clean_winrate": clean_wr, "clean_trades": int(len(clean_sub)),
         "detected_profile_name": detected_profile_name,
     }
     return out_df, summary
 
 
-# ======================== MINIMAL 4-METRIC BACKTEST UI ========================
+# ======================== UI ========================
 st.title("🧬 Polymarket Backtest Extractor")
 
 col_w, col_n = st.columns([2.2, 1.3])
 wallet_input = col_w.text_input("Địa chỉ ví (0x...) hoặc @username", value=DEFAULT_WALLET)
-custom_name_input = col_n.text_input(
-    "Tên file gợi nhớ (tùy chọn)",
-    placeholder="Bỏ trống = tự lấy tên profile",
+custom_name_input = col_n.text_input("Tên file gợi nhớ (tùy chọn)", placeholder="Bỏ trống = tự lấy tên profile")
+
+opt_c1, opt_c2 = st.columns(2)
+ai_clean_only = opt_c1.checkbox("Bản AI: Chỉ xuất kèo đã tất toán (Clean)", value=True)
+ai_months_opt = opt_c2.selectbox(
+    "Phạm vi tháng cho bản AI",
+    options=[0, 2, 3],
+    format_func=lambda m: "Toàn bộ lịch sử" if m == 0 else f"{m} tháng gần nhất",
 )
 
 if st.button("⚡ TRÍCH XUẤT CSV", type="primary", use_container_width=True):
-    with st.spinner("Đang định danh profile & đồng bộ dữ liệu..."):
+    with st.spinner("Đang đồng bộ đa luồng & kiểm toán dữ liệu..."):
         try:
-            resolved_wallet, auto_name, err_msg = resolve_wallet_and_name(wallet_input)
+            resolved_wallet, preset_name, err_msg = resolve_wallet_only(wallet_input)
             if err_msg:
                 st.error(err_msg)
                 st.stop()
 
             ledger_df, summary = build_backtest_ledger(resolved_wallet)
 
-            # Nếu bước đầu chưa lấy được username nhưng payload API có tên profile -> cập nhật lại auto_name
-            api_prof = sanitize_filename_part(summary.get("detected_profile_name", ""))
-            if api_prof and re.match(r"^0x[a-fA-F0-9]{4}_[a-fA-F0-9]{4}$", auto_name):
-                auto_name = api_prof
+            auto_name = preset_name
+            if not auto_name:
+                api_prof = sanitize_filename_part(summary.get("detected_profile_name", ""))
+                if api_prof:
+                    auto_name = api_prof
+                else:
+                    found_name = lookup_profile_name_by_wallet(resolved_wallet)
+                    auto_name = sanitize_filename_part(found_name) or f"{resolved_wallet[:6]}_{resolved_wallet[-4:]}"
                 st.session_state.setdefault("wallet_profile_cache", {})[wallet_input.strip().lower()] = (
                     resolved_wallet,
                     auto_name,
@@ -801,9 +777,16 @@ if "backtest_pack" in st.session_state:
         st.warning(f"Không có dữ liệu cho ví `{resolved_wallet}`.")
     else:
         final_label = sanitize_filename_part(custom_name_input) or auto_name
-        csv_filename = f"{final_label}.csv"
+        ai_df = build_ai_slim_csv(ledger_df, clean_only=ai_clean_only, recent_months=ai_months_opt)
 
-        st.caption(f"Ví đã trích xuất: `{resolved_wallet}` • Profile: **{auto_name}** • File xuất: **{csv_filename}**")
+        raw_bytes = ledger_df.to_csv(index=False).encode("utf-8-sig")
+        ai_bytes = ai_df.to_csv(index=False).encode("utf-8-sig")
+        saved_pct = (1.0 - len(ai_bytes) / max(len(raw_bytes), 1)) * 100.0
+
+        st.caption(
+            f"Ví: `{resolved_wallet}` • Profile: **{auto_name}** • "
+            f"Bản AI gọn hơn **{saved_pct:.0f}%** ({len(ai_df):,}/{len(ledger_df):,} dòng)"
+        )
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Volume (Mua 1 chiều)", f"${summary['volume']:,.0f}")
@@ -819,11 +802,19 @@ if "backtest_pack" in st.session_state:
             f"ROI: **{summary['clean_roi_pct']:+.3f}%**"
         )
 
-        st.download_button(
-            label=f"📥 TẢI FILE CSV ({csv_filename})",
-            data=ledger_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name=csv_filename,
+        dl1, dl2 = st.columns(2)
+        dl1.download_button(
+            label=f"⚡ TẢI CSV GỌN CHO AI ({final_label}_ai.csv)",
+            data=ai_bytes,
+            file_name=f"{final_label}_ai.csv",
             mime="text/csv",
             type="primary",
+            use_container_width=True,
+        )
+        dl2.download_button(
+            label=f"📦 TẢI CSV GỐC ĐẦY ĐỦ ({final_label}.csv)",
+            data=raw_bytes,
+            file_name=f"{final_label}.csv",
+            mime="text/csv",
             use_container_width=True,
         )
